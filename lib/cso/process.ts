@@ -74,6 +74,47 @@ export function childEnvironment(home: string): Record<string, string> {
     GIT_ATTR_NOSYSTEM: '1',
   };
 }
+/**
+ * Redact each same-stream run of captured output in place. The result is
+ * released only when every view a reader could assemble from it (each channel,
+ * both concatenation orders, and the chronological interleaving) is free of
+ * findings; a span crossing a channel boundary or one that cannot be located
+ * therefore still withholds both channels.
+ */
+function spliceRedaction(
+  ordered: Buffer[],
+  streams: Array<Buffer[]>,
+  out: Buffer[],
+): { stdout: string; stderr: string } | null {
+  const runs: Array<{ stdout: boolean; text: string }> = [];
+  for (let i = 0; i < ordered.length;) {
+    let j = i;
+    while (j < ordered.length && streams[j] === streams[i]) j++;
+    const bytes = Buffer.concat(ordered.slice(i, j)),
+      text = bytes.toString('utf8');
+    if (!Buffer.from(text, 'utf8').equals(bytes)) return null;
+    runs.push({ stdout: streams[i] === out, text });
+    i = j;
+  }
+  const released: Array<{ stdout: boolean; text: string }> = [];
+  for (const run of runs) {
+    const text = redactFindingSpans(run.text, { maxBytes: MAX_OUTPUT });
+    if (text === null) return null;
+    released.push({ stdout: run.stdout, text });
+  }
+  const stdout = released
+      .filter((run) => run.stdout)
+      .map((run) => run.text)
+      .join(''),
+    stderr = released
+      .filter((run) => !run.stdout)
+      .map((run) => run.text)
+      .join(''),
+    chronological = released.map((run) => run.text).join('');
+  const views = [stdout, stderr, stdout + stderr, stderr + stdout, chronological];
+  if (views.some((view) => redactFindingSpans(view, { maxBytes: 4 * MAX_OUTPUT }) !== view)) return null;
+  return { stdout, stderr };
+}
 export function redact(value: string): string {
   // Scan the complete bounded stream, including across write/chunk boundaries.
   const output = redactFindingSpans(value, { maxBytes: MAX_OUTPUT });
@@ -172,6 +213,16 @@ function safeMetadata(value: string, key: string): boolean {
   if (key === 'signature' && /^[a-f0-9]{128}$/.test(value)) return true;
   if (key === 'image' && /^[a-z0-9./:_-]+@sha256:[a-f0-9]{64}$/.test(value)) return true;
   if (key === 'integrity' && /^(?:sha256|sha512)-[A-Za-z0-9+/]+={0,2}$/.test(value)) return true;
+  if (
+    ['catalog', 'catalogRevision', 'scannerCatalog'].includes(key) &&
+    /^cso-(?:scanners|v3|eval)-[a-z0-9._-]{1,120}$/.test(value)
+  )
+    return true;
+  if (
+    key === 'workflow' &&
+    /^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/actions\/runs\/[0-9]{1,20}$/.test(value)
+  )
+    return true;
   return false;
 }
 function sanitizeJson(value: unknown, key: string, seen: WeakSet<object>, trustedMetadata: boolean): unknown {
@@ -455,6 +506,8 @@ export async function runProcess(
     maxBytes?: number;
     input?: string;
     raw?: boolean; // Only for inert Git framing or private helper/Docker control JSON that is validated before use. Never print or persist raw results.
+    /** `splice` replaces each located sensitive span with a marker instead of withholding both channels. */
+    redaction?: 'withhold' | 'splice';
   },
 ): Promise<ProcessResult> {
   if (!isAbsolute(file) || !isAbsolute(opts.cwd) || !existsSync(opts.cwd))
@@ -476,7 +529,8 @@ export async function runProcess(
     });
     const out: Buffer[] = [],
       err: Buffer[] = [],
-      ordered: Buffer[] = [];
+      ordered: Buffer[] = [],
+      streams: Array<Buffer[]> = [];
     let bytes = 0,
       timedOut = false,
       truncated = false;
@@ -502,6 +556,7 @@ export async function runProcess(
       }
       target.push(chunk);
       ordered.push(chunk);
+      streams.push(target);
     };
     child.stdout.on('data', capture(out));
     child.stderr.on('data', capture(err));
@@ -526,6 +581,12 @@ export async function runProcess(
         const forward = stdout + stderr,
           reverse = stderr + stdout,
           chronological = Buffer.concat(ordered).toString('utf8');
+        const spliced =
+          opts.redaction === 'splice' && !truncated ? spliceRedaction(ordered, streams, out) : null;
+        if (spliced) {
+          resolve({ code: code ?? -1, ...spliced, timedOut, truncated, capturedBytes: bytes });
+          return;
+        }
         if ([stdout, stderr, forward, reverse, chronological].some((value) => redact(value) !== value)) {
           resolve({
             code: code ?? -1,
