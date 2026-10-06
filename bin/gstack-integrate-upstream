@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# Reconcile the upstream gstack branch in a separate worktree, then activate
+# the exact revision the operator tested. This never resets or stashes work.
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  gstack-integrate-upstream prepare [--repo PATH] [--worktree PATH] [--branch NAME] [--upstream REMOTE]
+  gstack-integrate-upstream status  [--repo PATH] [--worktree PATH] [--branch NAME] [--upstream REMOTE]
+  gstack-integrate-upstream apply COMMIT [--repo PATH] [--worktree PATH] [--branch NAME] [--upstream REMOTE]
+
+prepare fetches upstream/main, then merges local main and upstream/main into an
+integration worktree. Resolve any conflict there and test that worktree.
+apply requires its exact tested commit, fast-forwards local main, and refreshes
+both Claude Code and Codex. It does not push to a remote.
+USAGE
+}
+
+die() { printf 'gstack-integrate-upstream: %s\n' "$*" >&2; exit 1; }
+
+[[ $# -gt 0 ]] || { usage; exit 2; }
+ACTION=$1
+shift
+case "$ACTION" in prepare|status|apply) ;; -h|--help|help) usage; exit 0 ;; *) usage >&2; exit 2 ;; esac
+
+TESTED_SHA=
+if [[ "$ACTION" == apply ]]; then
+  [[ $# -gt 0 && "$1" != --* ]] || die 'apply needs the full commit ID printed by prepare.'
+  TESTED_SHA=$1
+  shift
+  [[ "$TESTED_SHA" =~ ^[0-9a-f]{40}$|^[0-9a-f]{64}$ ]] || die 'use a full hexadecimal commit ID.'
+fi
+
+SCRIPT_DIR=$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO=${GSTACK_INTEGRATION_REPO:-"$SCRIPT_DIR/.."}
+WORKTREE=${GSTACK_INTEGRATION_WORKTREE:-}
+BRANCH=${GSTACK_INTEGRATION_BRANCH:-codex/gstack-integration}
+UPSTREAM=${GSTACK_INTEGRATION_UPSTREAM:-origin}
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --repo|--worktree|--branch|--upstream)
+      [[ $# -ge 2 && -n "$2" ]] || die "$1 needs a value."
+      case "$1" in
+        --repo) REPO=$2 ;; --worktree) WORKTREE=$2 ;;
+        --branch) BRANCH=$2 ;; --upstream) UPSTREAM=$2 ;;
+      esac
+      shift 2 ;;
+    *) die "unknown argument: $1" ;;
+  esac
+done
+
+[[ -d "$REPO" ]] || die "checkout does not exist: $REPO"
+REPO=$(cd -P -- "$REPO" && pwd)
+[[ "$(git -C "$REPO" rev-parse --show-toplevel 2>/dev/null || :)" == "$REPO" ]] \
+  || die "not a Git worktree root: $REPO"
+[[ -f "$REPO/VERSION" && -f "$REPO/setup" ]] || die "not a gstack checkout: $REPO"
+[[ "$(git -C "$REPO" symbolic-ref --quiet --short HEAD 2>/dev/null || :)" == main ]] \
+  || die "the source checkout must be on local main: $REPO"
+[[ "$BRANCH" != main ]] || die 'the integration branch cannot be main.'
+git check-ref-format --branch "$BRANCH" >/dev/null 2>&1 || die "invalid integration branch: $BRANCH"
+git -C "$REPO" remote get-url "$UPSTREAM" >/dev/null 2>&1 || die "unknown upstream remote: $UPSTREAM"
+if [[ -z "$WORKTREE" ]]; then WORKTREE="$(dirname "$REPO")/$(basename "$REPO")-integration"; fi
+if [[ -e "$WORKTREE" ]]; then
+  WORKTREE=$(cd -P -- "$WORKTREE" && pwd)
+else
+  WORKTREE="$(cd -P -- "$(dirname "$WORKTREE")" && pwd)/$(basename "$WORKTREE")"
+fi
+[[ "$WORKTREE" != "$REPO" ]] || die 'integration worktree must differ from main.'
+
+common_dir() {
+  local root=$1 dir
+  dir=$(git -C "$root" rev-parse --git-common-dir 2>/dev/null) || return 1
+  if [[ "$dir" == /* ]]; then (cd -P -- "$dir" && pwd)
+  else (cd -P -- "$root/$dir" && pwd)
+  fi
+}
+
+check_worktree() {
+  [[ -d "$WORKTREE" ]] || die "integration worktree is missing: $WORKTREE (run prepare)."
+  [[ "$(git -C "$WORKTREE" rev-parse --show-toplevel 2>/dev/null || :)" == "$WORKTREE" ]] \
+    || die "integration path is not a Git worktree root: $WORKTREE"
+  [[ "$(common_dir "$WORKTREE")" == "$(common_dir "$REPO")" ]] \
+    || die "integration path belongs to another repository: $WORKTREE"
+  [[ "$(git -C "$WORKTREE" symbolic-ref --quiet --short HEAD 2>/dev/null || :)" == "$BRANCH" ]] \
+    || die "integration worktree is not on $BRANCH: $WORKTREE"
+}
+
+clean_worktree() {
+  local root=$1
+  [[ -z "$(git -C "$root" status --porcelain)" ]] \
+    || die "integration worktree has changes; resolve, commit, or move them before continuing: $root"
+}
+
+if [[ "$ACTION" == prepare ]]; then
+  printf 'Fetching %s/main from %s\n' "$UPSTREAM" "$(git -C "$REPO" remote get-url "$UPSTREAM")"
+  GIT_TERMINAL_PROMPT=0 git -C "$REPO" fetch "$UPSTREAM" main
+  if [[ -e "$WORKTREE" ]]; then
+    check_worktree
+    clean_worktree "$WORKTREE"
+  else
+    if git -C "$REPO" show-ref --verify --quiet "refs/heads/$BRANCH"; then
+      die "$BRANCH is checked out elsewhere or has no worktree; use --worktree with its existing path."
+    fi
+    git -C "$REPO" worktree add -b "$BRANCH" "$WORKTREE" main
+  fi
+  printf 'Merging local main into %s\n' "$BRANCH"
+  git -C "$WORKTREE" merge --no-edit main \
+    || die "local-main merge stopped; resolve conflicts in $WORKTREE, commit, then run prepare again."
+  printf 'Merging %s/main into %s\n' "$UPSTREAM" "$BRANCH"
+  git -C "$WORKTREE" merge --no-edit "$UPSTREAM/main" \
+    || die "upstream merge stopped; resolve conflicts in $WORKTREE, commit, then run prepare again."
+fi
+
+check_worktree
+if [[ "$ACTION" == apply ]]; then
+  clean_worktree "$WORKTREE"
+  [[ -z "$(git -C "$REPO" diff --name-only)$(git -C "$REPO" diff --cached --name-only)" ]] \
+    || die "local main has tracked changes; preserve them before apply: $REPO"
+  CURRENT_SHA=$(git -C "$WORKTREE" rev-parse HEAD)
+  [[ "$CURRENT_SHA" == "$TESTED_SHA" ]] \
+    || die "integration HEAD changed to $CURRENT_SHA; test that commit and apply its full ID."
+  git -C "$WORKTREE" merge-base --is-ancestor main HEAD \
+    || die 'local main advanced after prepare; run prepare and test the new integration commit.'
+  git -C "$REPO" merge --ff-only "$BRANCH" \
+    || die 'local main could not fast-forward; run prepare again.'
+  printf 'Local main is now %s. Refreshing Claude Code...\n' "$CURRENT_SHA"
+  (cd "$REPO" && ./setup --host claude) \
+    || die "Claude Code setup failed after main advanced. Retry: cd '$REPO' && ./setup --host claude"
+  printf 'Refreshing Codex...\n'
+  (cd "$REPO" && ./setup --host codex) \
+    || die "Codex setup failed after main advanced. Retry: cd '$REPO' && ./setup --host codex"
+  printf 'Both hosts refreshed. Local main: %s. No remote was pushed.\n' "$CURRENT_SHA"
+else
+  printf 'Main:        %s\n' "$(git -C "$REPO" rev-parse HEAD)"
+  printf 'Integration: %s (%s)\n' "$(git -C "$WORKTREE" rev-parse HEAD)" "$WORKTREE"
+  printf 'Upstream:    %s (%s/main)\n' "$(git -C "$REPO" rev-parse "$UPSTREAM/main")" "$UPSTREAM"
+  if [[ "$ACTION" == prepare ]]; then
+    printf '\nTest the integration worktree, then apply its full commit ID:\n'
+    printf '  cd %q && bun run typecheck && bun run test\n' "$WORKTREE"
+    printf '  %q apply %s\n' "$0" "$(git -C "$WORKTREE" rev-parse HEAD)"
+  fi
+fi

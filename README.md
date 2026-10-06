@@ -119,6 +119,10 @@ An explicit `--host X` installs for X only and never changes another agent's
 install. `/gstack-upgrade` refreshes every install it registered, one row per
 host, and says which ones failed.
 
+If you keep custom commits on a local gstack checkout, use the
+[upstream integration workflow](docs/howto-integrate-custom-gstack.md) to merge
+new upstream commits in a separate worktree before refreshing both hosts.
+
 Tiers: **full** is certified by a real workflow run (see
 [Certify your host](docs/ADDING_A_HOST.md#certify-your-host)); **experimental**
 installs and passes the conformance tests but has no certification run yet;
