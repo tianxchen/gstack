@@ -137,7 +137,7 @@ else
   printf 'Upstream:    %s (%s/main)\n' "$(git -C "$REPO" rev-parse "$UPSTREAM/main")" "$UPSTREAM"
   if [[ "$ACTION" == prepare ]]; then
     printf '\nTest the integration worktree, then apply its full commit ID:\n'
-    printf '  cd %q && bun run typecheck && bun run test\n' "$WORKTREE"
+    printf '  cd %q && bun install --frozen-lockfile && bun run typecheck && bun run test\n' "$WORKTREE"
     printf '  %q apply %s\n' "$0" "$(git -C "$WORKTREE" rev-parse HEAD)"
   fi
 fi

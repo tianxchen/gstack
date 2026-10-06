@@ -70,6 +70,7 @@ test('prepare preserves local commits; apply advances main only for the tested S
 
   const prepared = call(main, integration, 'prepare');
   expect(prepared.code).toBe(0);
+  expect(prepared.out).toContain('bun install --frozen-lockfile && bun run typecheck');
   expect(git(main, 'rev-parse', 'HEAD')).toBe(oldMain);
   expect(readFileSync(join(integration, 'local.txt'), 'utf8')).toBe('customized\n');
   expect(readFileSync(join(integration, 'upstream.txt'), 'utf8')).toBe('new upstream feature\n');
