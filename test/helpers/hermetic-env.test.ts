@@ -3,7 +3,8 @@
  *
  * Pins three contracts:
  * 1. Allowlist semantics: contamination vars dropped, basics/auth/network
- *    kept, overrides merge last, EVALS_HERMETIC=0 is byte-identical legacy.
+ *    kept, overrides merge last, EVALS_HERMETIC=0 is the legacy env plus the
+ *    DISABLE_AUTOUPDATER pin.
  * 2. Seed-config shape: 20-char key suffix, trusted dirs, undefined-key safe.
  * 3. Dir lifecycle: /.claude suffix (extractPlanFilePath contract —
  *    claude-pty-runner.ts:191), sync singleton reuse, pid-aware GC.
@@ -13,6 +14,8 @@ import { describe, test, expect, afterAll } from 'bun:test';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { execFileSync } from 'node:child_process';
+import { seedCeoFindingProject } from './ceo-finding-fixture';
 import {
   buildHermeticEnv,
   buildSeedConfig,
@@ -20,6 +23,8 @@ import {
   getHermeticDirs,
   gcStaleHermeticDirs,
   hermeticChildEnv,
+  hermeticCeoPlanReadArgs,
+  hermeticDesignReadArgs,
 } from './hermetic-env';
 
 const CONTAMINATED: NodeJS.ProcessEnv = {
@@ -112,6 +117,71 @@ describe('buildHermeticEnv allowlist', () => {
     expect(e.GH_TOKEN).toBeUndefined(); // not in extraAllow
   });
 
+  test('prefixes keep CI metadata but do not admit credential-shaped operator names', () => {
+    const base = {
+      ...CONTAMINATED,
+      GITHUB_TOKEN: 'synthetic-token',
+      GITHUB_PERSONAL_ACCESS_TOKEN: 'synthetic-pat',
+      GITHUB_APP_PRIVATE_KEY: 'synthetic-private-key',
+      GITHUB_CLIENT_SECRET: 'synthetic-client-secret',
+      GITHUB_PAT: 'synthetic-pat-short',
+      EVALS_API_KEY: 'synthetic-eval-key',
+      GITHUB_SHA: 'abc123',
+      GITHUB_PATH: '/tmp/actions-path',
+      GITHUB_TOKENIZER: 'metadata-tokenizer',
+      GITHUB_KEYRING: 'metadata-keyring',
+      EVALS_RUN_ID: 'run-123',
+      EVALS_SELECTION_JSON: '{}',
+    };
+    const result = buildHermeticEnv(base, HERMETIC_VARS);
+    for (const name of [
+      'GITHUB_TOKEN', 'GITHUB_PERSONAL_ACCESS_TOKEN', 'GITHUB_APP_PRIVATE_KEY',
+      'GITHUB_CLIENT_SECRET', 'GITHUB_PAT', 'EVALS_API_KEY', 'GH_TOKEN',
+    ]) expect(result[name]).toBeUndefined();
+    for (const name of [
+      'GITHUB_ACTIONS', 'GITHUB_SHA', 'GITHUB_PATH', 'GITHUB_TOKENIZER',
+      'GITHUB_KEYRING', 'EVALS_MODEL', 'EVALS_RUN_ID', 'EVALS_SELECTION_JSON',
+    ]) expect(result[name]).toBe(base[name]);
+  });
+
+  test('a trailing qualifier does not carry a credential past the prefix rule (#2949)', () => {
+    const qualified = {
+      GITHUB_APP_PRIVATE_KEY_BASE64: 'synthetic-pem-base64',
+      GITHUB_PRIVATE_KEY_PEM: 'synthetic-pem',
+      GITHUB_TOKEN_1: 'synthetic-first-token',
+      GITHUB_TOKEN_GHES: 'synthetic-enterprise-token',
+      GITHUB_CLIENT_SECRET_VALUE: 'synthetic-client-secret',
+      EVALS_API_KEY_FALLBACK: 'synthetic-eval-key',
+    };
+    const result = buildHermeticEnv({ ...CONTAMINATED, ...qualified }, HERMETIC_VARS);
+    for (const name of Object.keys(qualified)) expect(result[name]).toBeUndefined();
+    const serialized = JSON.stringify(result);
+    for (const value of Object.values(qualified)) expect(serialized.includes(value)).toBe(false);
+
+    // Segments, not substrings: names that merely contain a credential word
+    // stay metadata, and an explicit runner admission still wins.
+    const metadata = { GITHUB_PATH: '/tmp/p', GITHUB_TOKENIZER: 't', GITHUB_KEYRING: 'k', GITHUB_REF_PROTECTED: 'false', EVALS_RUN_ID: 'r' };
+    const kept = buildHermeticEnv({ ...CONTAMINATED, ...metadata, ...qualified }, HERMETIC_VARS, undefined, { extraAllow: ['GITHUB_TOKEN_1'] });
+    for (const [name, value] of Object.entries(metadata)) expect(kept[name]).toBe(value);
+    expect(kept.GITHUB_TOKEN_1).toBe(qualified.GITHUB_TOKEN_1);
+  });
+
+  test('explicit provider auth, runner admissions, and overrides still win', () => {
+    const base = {
+      ...CONTAMINATED,
+      GITHUB_TOKEN: 'synthetic-token',
+      GEMINI_API_KEY: 'synthetic-gemini',
+    };
+    const result = buildHermeticEnv(base, HERMETIC_VARS, {
+      GITHUB_APP_PRIVATE_KEY: 'synthetic-override',
+    }, { extraAllow: ['GEMINI_*', 'GITHUB_TOKEN'] });
+    expect(result.ANTHROPIC_API_KEY).toBe(base.ANTHROPIC_API_KEY);
+    expect(result.GEMINI_API_KEY).toBe(base.GEMINI_API_KEY);
+    expect(result.GITHUB_TOKEN).toBe(base.GITHUB_TOKEN);
+    expect(result.GITHUB_APP_PRIVATE_KEY).toBe('synthetic-override');
+    expect(buildHermeticEnv(base, HERMETIC_VARS).GITHUB_TOKEN).toBeUndefined();
+  });
+
   test('TERM falls back when base omits it', () => {
     const base = { ...CONTAMINATED } as NodeJS.ProcessEnv;
     delete base.TERM;
@@ -120,7 +190,7 @@ describe('buildHermeticEnv allowlist', () => {
 });
 
 describe('EVALS_HERMETIC=0 escape hatch', () => {
-  test('returns byte-identical legacy env, overrides still last', () => {
+  test('returns the legacy env plus the updater pin, overrides still last', () => {
     const base = { ...CONTAMINATED, EVALS_HERMETIC: '0' } as NodeJS.ProcessEnv;
     const e = buildHermeticEnv(base, HERMETIC_VARS, { GSTACK_HEADLESS: '1' });
     // Legacy spread: every base var survives, hermeticVars NOT applied.
@@ -128,7 +198,7 @@ describe('EVALS_HERMETIC=0 escape hatch', () => {
     expect(e.CLAUDE_CONFIG_DIR).toBe('/Users/op/.claude');
     expect(e.GSTACK_HOME).toBe('/Users/op/.gstack');
     expect(e.GSTACK_HEADLESS).toBe('1');
-    expect(e).toEqual({ ...(base as Record<string, string>), GSTACK_HEADLESS: '1' });
+    expect(e).toEqual({ ...(base as Record<string, string>), DISABLE_AUTOUPDATER: '1', GSTACK_HEADLESS: '1' });
   });
 
   test('isHermeticEnabled reads at call time (ESM-hoist safety)', () => {
@@ -154,6 +224,7 @@ describe('buildSeedConfig', () => {
       trustedDirs: ['/repo/root'],
     }) as any;
     expect(seed.hasCompletedOnboarding).toBe(true);
+    expect(seed.diffSidebarOpen).toBe(false);
     const approved = seed.customApiKeyResponses.approved;
     expect(approved).toHaveLength(1);
     expect(approved[0]).toHaveLength(20);
@@ -193,6 +264,7 @@ describe('getHermeticDirs lifecycle', () => {
     const dirs = getHermeticDirs();
     const seed = JSON.parse(fs.readFileSync(path.join(dirs.configDir, '.claude.json'), 'utf-8'));
     expect(seed.hasCompletedOnboarding).toBe(true);
+    expect(seed.diffSidebarOpen).toBe(false);
     const root = path.resolve(__dirname, '..', '..');
     expect(seed.projects[root].hasTrustDialogAccepted).toBe(true);
   });
@@ -266,4 +338,146 @@ describe('hermeticChildEnv composition', () => {
 
 afterAll(() => {
   // The singleton's own exit hook handles runRoot; nothing else to clean.
+});
+
+
+describe('split CEO artifact Read scope', () => {
+  function fixture(check: (cwd: string, env: Record<string, string>) => void): void {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-e2e-plan-ceo-split-overflow-'));
+    try {
+      seedCeoFindingProject(cwd, 'Review the supplied scope.');
+      check(cwd, hermeticChildEnv());
+    } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
+  }
+
+  test('grants only this fixture\'s generated markdown Read rules', () => {
+    fixture((cwd, env) => {
+      const scope = path.join(getHermeticDirs().gstackHome, 'projects', path.basename(cwd), 'ceo-plans');
+      const args = hermeticCeoPlanReadArgs(cwd, env);
+      expect(args).toEqual(['--allowedTools', ...new Set([scope, fs.realpathSync(scope)].map(directory =>
+        `Read(${directory.startsWith('/') ? '/' : ''}${directory.split(path.sep).join('/')}/*.md)`))]);
+      expect(args.join(' ')).not.toContain('/**');
+      expect(args.join(' ')).not.toMatch(/Write\(|Edit\(|Bash\(|--add-dir/);
+      expect(hermeticCeoPlanReadArgs(cwd, env)).toEqual(args);
+    });
+  });
+
+  test('refuses operator/foreign homes and a project-slug override', () => {
+    fixture((cwd, env) => {
+      for (const home of [path.join(os.homedir(), '.gstack'), path.dirname(env.GSTACK_HOME!), env.GSTACK_HOME! + '-other']) {
+        expect(() => hermeticCeoPlanReadArgs(cwd, { ...env, GSTACK_HOME: home })).toThrow('private split fixture');
+      }
+      expect(() => hermeticCeoPlanReadArgs(cwd, { ...env, GSTACK_PROJECT_SLUG: 'another-fixture' })).toThrow('private split fixture');
+    });
+  });
+
+  test('refuses a remote-derived foreign project slug', () => {
+    fixture((cwd, env) => {
+      execFileSync('git', ['remote', 'add', 'origin', 'https://example.invalid/foreign/repo.git'], { cwd, timeout: 10_000 });
+      expect(() => hermeticCeoPlanReadArgs(cwd, env)).toThrow('exact fixture project slug');
+      expect(fs.existsSync(path.join(env.GSTACK_HOME!, 'projects', 'foreign-repo'))).toBe(false);
+    });
+  });
+
+  test('refuses another fixture kind and nested or symlinked working directories', () => {
+    fixture((cwd, env) => {
+      const other = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-e2e-plan-ceo-finding-'));
+      const nested = path.join(cwd, path.basename(cwd));
+      const link = cwd + 'link';
+      try {
+        fs.mkdirSync(nested); fs.symlinkSync(cwd, link, 'dir');
+        for (const target of [other, nested, link]) expect(() => hermeticCeoPlanReadArgs(target, env)).toThrow();
+      } finally { fs.rmSync(other, { recursive: true, force: true }); fs.unlinkSync(link); }
+    });
+  });
+
+  test('refuses a substituted scope or project without reading its target', () => {
+    fixture((cwd, env) => {
+      const project = path.join(env.GSTACK_HOME!, 'projects', path.basename(cwd));
+      const foreign = fs.mkdtempSync(path.join(os.tmpdir(), 'foreign-ceo-documents-'));
+      fs.writeFileSync(path.join(foreign, 'sentinel.md'), 'foreign evidence');
+      try {
+        fs.mkdirSync(path.dirname(project), { recursive: true });
+        fs.symlinkSync(foreign, project, 'dir');
+        expect(() => hermeticCeoPlanReadArgs(cwd, env)).toThrow('substituted directories');
+        fs.unlinkSync(project); fs.mkdirSync(project);
+        fs.symlinkSync(foreign, path.join(project, 'ceo-plans'), 'dir');
+        expect(() => hermeticCeoPlanReadArgs(cwd, env)).toThrow('substituted directories');
+        expect(fs.readdirSync(foreign)).toEqual(['sentinel.md']);
+        expect(fs.readFileSync(path.join(foreign, 'sentinel.md'), 'utf8')).toBe('foreign evidence');
+      } finally { fs.rmSync(project, { recursive: true, force: true }); fs.rmSync(foreign, { recursive: true, force: true }); }
+    });
+  });
+
+  test('refuses non-hermetic launches', () => {
+    fixture((cwd, env) => {
+      const before = process.env.EVALS_HERMETIC;
+      try {
+        process.env.EVALS_HERMETIC = '0';
+        expect(() => hermeticCeoPlanReadArgs(cwd, env)).toThrow('requires hermetic mode');
+      } finally {
+        if (before === undefined) delete process.env.EVALS_HERMETIC;
+        else process.env.EVALS_HERMETIC = before;
+      }
+    });
+  });
+});
+
+
+
+describe('Design artifact Read scope', () => {
+  function fixture(prefix: string, check: (cwd: string, env: Record<string, string>) => void): void {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+    try {
+      seedCeoFindingProject(cwd, 'Review the supplied design.');
+      check(cwd, hermeticChildEnv());
+    } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
+  }
+
+  for (const prefix of ['gstack-e2e-plan-design-', 'design-ui-project-']) {
+    test(`grants only generated PNG Read for ${prefix}`, () => fixture(prefix, (cwd, env) => {
+      const scope = path.join(getHermeticDirs().gstackHome, 'projects', path.basename(cwd), 'designs');
+      const args = hermeticDesignReadArgs(cwd, env);
+      expect(args).toEqual(['--allowedTools', ...new Set([scope, fs.realpathSync(scope)].map(directory =>
+        `Read(${directory.startsWith('/') ? '/' : ''}${directory.split(path.sep).join('/')}/*/*.png)`))]);
+      expect(args.join(' ')).not.toContain('/**');
+      expect(args.join(' ')).not.toMatch(/Write\(|Edit\(|Bash\(|--add-dir|\.md\)/);
+      expect(hermeticDesignReadArgs(cwd, env)).toEqual(args);
+    }));
+  }
+
+  test('refuses operator/foreign roots, slug overrides and another fixture kind', () => {
+    fixture('gstack-e2e-plan-design-', (cwd, env) => {
+      for (const home of [path.join(os.homedir(), '.gstack'), path.dirname(env.GSTACK_HOME!), env.GSTACK_HOME! + '-other']) {
+        expect(() => hermeticDesignReadArgs(cwd, { ...env, GSTACK_HOME: home })).toThrow('private Design fixture');
+      }
+      expect(() => hermeticDesignReadArgs(cwd, { ...env, GSTACK_PROJECT_SLUG: 'foreign' })).toThrow('private Design fixture');
+      execFileSync('git', ['remote', 'add', 'origin', 'https://example.invalid/foreign/repo.git'], { cwd, timeout: 5000 });
+      expect(() => hermeticDesignReadArgs(cwd, env)).toThrow('exact fixture project slug');
+    });
+    fixture('gstack-e2e-plan-ceo-split-overflow-', (cwd, env) => {
+      expect(() => hermeticDesignReadArgs(cwd, env)).toThrow('private Design fixture');
+    });
+  });
+
+  test('refuses substituted working directories, projects and image roots without touching the target', () => {
+    fixture('gstack-e2e-plan-design-', (cwd, env) => {
+      const project = path.join(env.GSTACK_HOME!, 'projects', path.basename(cwd));
+      const foreign = fs.mkdtempSync(path.join(os.tmpdir(), 'foreign-design-images-'));
+      const link = cwd + 'link';
+      fs.writeFileSync(path.join(foreign, 'sentinel.png'), 'foreign image');
+      try {
+        fs.symlinkSync(cwd, link, 'dir');
+        expect(() => hermeticDesignReadArgs(link, env)).toThrow();
+        fs.mkdirSync(path.dirname(project), { recursive: true });
+        fs.symlinkSync(foreign, project, 'dir');
+        expect(() => hermeticDesignReadArgs(cwd, env)).toThrow('substituted directories');
+        fs.unlinkSync(project); fs.mkdirSync(project);
+        fs.symlinkSync(foreign, path.join(project, 'designs'), 'dir');
+        expect(() => hermeticDesignReadArgs(cwd, env)).toThrow('substituted directories');
+        expect(fs.readdirSync(foreign)).toEqual(['sentinel.png']);
+        expect(fs.readFileSync(path.join(foreign, 'sentinel.png'), 'utf8')).toBe('foreign image');
+      } finally { fs.rmSync(project, { recursive: true, force: true }); fs.unlinkSync(link); fs.rmSync(foreign, { recursive: true, force: true }); }
+    });
+  });
 });

@@ -18,14 +18,14 @@
  * ({{ASIDE_SETUP}}) plus the gstack-browser fallback block now ride in every
  * browsing skill (~9KB), which pushed benchmark and scrape past 1.5× of the
  * v1.69.1.0 anchor. Deliberate, corpus-wide, receipted in the v1.81.0.0
- * CHANGELOG; the v1.69.1.0 fixture stays on disk for history.
+ * CHANGELOG; the v1.69.1.0 fixture is in git history.
  *
  * The previous baseline lived at test/fixtures/parity-baseline-v1.69.1.0.json,
  * re-captured 2026-08-25 during token-reduction Phase 1 (bash consolidation
  * moved ~11-13KB of inline preamble bash per skill into bin/gstack-skill-start
  * and bin/gstack-skill-end — a deliberate corpus-wide shrink; receipt:
- * gstack-context-bill --diff in PR #2691). The prior v1.47.0.0 fixture stays
- * on disk for history. Live pins at capture time: this test (shrink floor)
+ * gstack-context-bill --diff in PR #2691). The prior v1.47.0.0 fixture is in
+ * git history. Live pins at capture time: this test (shrink floor)
  * and test/parity-suite.test.ts vs parity-baseline-v1.64.1.0.json (growth).
  *
  * Override:
@@ -250,10 +250,11 @@ describe('SKILL.md size budget regression (gate, free)', () => {
     // estimate was a moving target: 4177 solo, 8356 and 8041 in two parallel
     // runs. A repo-budget ratchet measures the catalog that ships; CI always
     // checks the PR's committed tree anyway.
-    const trackedPaths = execSync('git ls-files -- "*/SKILL.md"', { cwd: REPO_ROOT, encoding: 'utf-8', timeout: 30_000 })
+    // List paths from HEAD too: a staged-but-uncommitted skill is in the index
+    // but not yet in HEAD, so `git ls-files` + `git show HEAD:` disagree.
+    const trackedPaths = execSync('git ls-tree -r --name-only HEAD', { cwd: REPO_ROOT, encoding: 'utf-8', timeout: 30_000, maxBuffer: 16 * 1024 * 1024 })
       .split('\n')
-      .filter(Boolean)
-      .filter((p) => p.split('/').length === 2);
+      .filter((p) => p.endsWith('/SKILL.md') && p.split('/').length === 2);
     let descriptionBytes = 0;
     for (const rel of trackedPaths) {
       const committed = execSync(`git show HEAD:${JSON.stringify(rel)}`, {

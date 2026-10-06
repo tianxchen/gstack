@@ -13,7 +13,8 @@
  *       order given. For tests that exercise specific workflow steps.
  *   - extractSkillBody(skillDir)
  *       frontmatter + intro + everything AFTER the shared generated preamble
- *       ("## Preamble (run first)" .. end of "## Plan Status Footer").
+ *       ("## Preamble (run first)" or "## Preamble (after scope gate)"
+ *       .. end of "## Plan Status Footer").
  *       For tests that exercise the skill's ENTIRE specific flow but never
  *       touch the ~780-line shared preamble.
  *   - extractSkillHead(skillDir, bodyLineCount)
@@ -101,7 +102,7 @@ export const CODEX_REVIEW_E2E_SECTIONS = [
 
 /** First/last H2 headings of the shared preamble block that gen-skill-docs
  *  emits into every tier >= 2 skill. extractSkillBody drops this range. */
-const SHARED_PREAMBLE_FIRST = 'Preamble (run first)';
+const SHARED_PREAMBLE_FIRST = ['Preamble (run first)', 'Preamble (after scope gate)'];
 const SHARED_PREAMBLE_LAST = 'Plan Status Footer';
 
 interface H2Section {
@@ -147,8 +148,10 @@ function splitFrontmatter(raw: string, file: string): { frontmatter: string; bod
  * output format, the /context-save checkpoint template), NOT section
  * boundaries. Fences close only on a matching char of >= opening length,
  * per CommonMark, so 4-backtick fences embedding 3-backtick blocks work.
+ * Standalone generated STOP-Read blocks between horizontal rules replace
+ * entire carved steps and end the preceding H2. Nested pointers stay inside it.
  */
-function scanH2Sections(bodyLines: string[]): H2Section[] {
+function scanH2Sections(bodyLines: string[], stopAtH1 = false): H2Section[] {
   const sections: H2Section[] = [];
   let fence: { ch: string; len: number } | null = null;
 
@@ -165,17 +168,29 @@ function scanH2Sections(bodyLines: string[]): H2Section[] {
       }
       continue;
     }
-    if (!fence && line.startsWith('## ')) {
-      sections.push({ heading: line.slice(3).trim(), start: i, end: bodyLines.length });
+    if (!fence) {
+      const heading = line.startsWith('## ');
+      const title = stopAtH1 && /^ {0,3}#(?:[ \t]|$)/.test(line);
+      let carvedStep = /^> \*\*STOP\.\*\* Before .+, Read `[^`]+\/sections\/[^`]+\.md` and execute it$/.test(line)
+        && bodyLines[i + 1] === '> in full. Do not work from memory — that section is the source of truth for this step.';
+      if (carvedStep) {
+        let preceding = i - 1;
+        while (preceding >= 0 && !bodyLines[preceding].trim()) preceding--;
+        let following = i + 2;
+        while (following < bodyLines.length && !bodyLines[following].trim()) following++;
+        carvedStep = bodyLines[preceding] === '---' && bodyLines[following] === '---';
+      }
+      if (heading || title || carvedStep) {
+        const previous = sections.at(-1);
+        if (previous) previous.end = Math.min(previous.end, i);
+        if (heading) sections.push({ heading: line.slice(3).trim(), start: i, end: bodyLines.length });
+      }
     }
-  }
-  for (let s = 0; s < sections.length - 1; s++) {
-    sections[s].end = sections[s + 1].start;
   }
   return sections;
 }
 
-function loadSkill(skillDirOrFile: string): {
+function loadSkill(skillDirOrFile: string, stopAtH1 = false): {
   file: string;
   frontmatter: string;
   bodyLines: string[];
@@ -184,7 +199,7 @@ function loadSkill(skillDirOrFile: string): {
   const file = resolveSkillMd(skillDirOrFile);
   const raw = fs.readFileSync(file, 'utf-8');
   const { frontmatter, bodyLines } = splitFrontmatter(raw, file);
-  return { file, frontmatter, bodyLines, sections: scanH2Sections(bodyLines) };
+  return { file, frontmatter, bodyLines, sections: scanH2Sections(bodyLines, stopAtH1) };
 }
 
 function findSection(sections: H2Section[], name: string, file: string): H2Section {
@@ -220,15 +235,25 @@ export function extractSkillSections(skillDir: string, sections: string[]): stri
 }
 
 /**
- * Frontmatter + intro (everything before "## Preamble (run first)") + the
+ * Frontmatter + intro/scope gate (everything before either exact preamble heading) + the
  * full skill-specific body (everything after the "## Plan Status Footer"
  * section). Use when a test exercises the whole skill flow: this drops the
  * ~780-line shared generated preamble and nothing else.
  */
 export function extractSkillBody(skillDir: string): string {
-  const { file, frontmatter, bodyLines, sections: all } = loadSkill(skillDir);
-  const first = findSection(all, SHARED_PREAMBLE_FIRST, file);
-  const last = findSection(all, SHARED_PREAMBLE_LAST, file);
+  const { file, frontmatter, bodyLines, sections: all } = loadSkill(skillDir, true);
+  const boundary = (names: string[]): H2Section => {
+    const matches = all.filter(section => names.includes(section.heading));
+    const label = names.map(name => `"## ${name}"`).join(' or ');
+    if (!matches.length) throw new Error(`skill-fixture: section ${label} not found in ${file}.`);
+    if (matches.length !== 1) throw new Error(`skill-fixture: ambiguous section ${label} in ${file}.`);
+    return matches[0];
+  };
+  const first = boundary(SHARED_PREAMBLE_FIRST);
+  const last = boundary([SHARED_PREAMBLE_LAST]);
+  if (first.start >= last.start) {
+    throw new Error(`skill-fixture: "## ${SHARED_PREAMBLE_LAST}" precedes the preamble in ${file}.`);
+  }
   const intro = bodyLines.slice(0, first.start).join('\n').trimEnd();
   const tail = bodyLines.slice(last.end).join('\n').trimEnd();
   if (!tail) {
@@ -262,4 +287,17 @@ export function sliceBetween(text: string, start: string, end: string): string {
   const j = text.indexOf(end, i + start.length);
   if (j < 0) throw new Error(`skill fixture: end marker not found after start: ${end}`);
   return text.slice(i, j);
+}
+
+export function extractDesignResearchContract(skill: string): string {
+  const setup = sliceBetween(skill, '## BROWSER SETUP', '### Rules for driving a real browser');
+  const probe = setup.match(/```bash\n[\s\S]*?\n```/)?.[0];
+  if (!probe) throw new Error('skill fixture: design research readiness probe missing');
+  const routing = sliceBetween(skill, '## Web research runs in Aside', '## Phase 2: Research');
+  const search = sliceBetween(skill, '**Step 1: Identify', '**Step 2: Visual research');
+  const prelude = search.match(/^_EG=.*_aside_exec\(\).*$/m)?.[0];
+  if (!prelude) throw new Error('skill fixture: design research egress prelude missing');
+  return ['Run this readiness probe once before research:', probe, routing,
+    'For each Aside research call, include this prelude before invoking `_aside_exec` with the requested query:',
+    '```bash', prelude, '```'].join('\n\n');
 }

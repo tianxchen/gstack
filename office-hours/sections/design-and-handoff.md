@@ -5,21 +5,23 @@
 Write the design document to the project directory.
 
 ```bash
-eval "$(~/.claude/skills/gstack/bin/gstack-slug 2>/dev/null)" && mkdir -p ~/.gstack/projects/$SLUG
+GSTACK_STATE_ROOT=$(~/.claude/skills/gstack/bin/gstack-paths --get GSTACK_STATE_ROOT); : "${GSTACK_STATE_ROOT:?gstack-paths failed; reinstall with ./setup or /gstack-upgrade}"
+SLUG=$(~/.claude/skills/gstack/bin/gstack-slug --get SLUG 2>/dev/null) && mkdir -p "$GSTACK_STATE_ROOT/projects/$SLUG" && echo "PROJECT_DIR: $GSTACK_STATE_ROOT/projects/$SLUG"
 USER=$(whoami)
 DATETIME=$(date +%Y%m%d-%H%M%S)
 ```
 
 **Design lineage:** Before writing, check for existing design docs on this branch:
 ```bash
+GSTACK_STATE_ROOT=$(~/.claude/skills/gstack/bin/gstack-paths --get GSTACK_STATE_ROOT); : "${GSTACK_STATE_ROOT:?gstack-paths failed; reinstall with ./setup or /gstack-upgrade}"
 setopt +o nomatch 2>/dev/null || true  # zsh compat
-PRIOR=$(ls -t ~/.gstack/projects/$SLUG/*-$BRANCH-design-*.md 2>/dev/null | head -1)
+PRIOR=$(ls -t "$GSTACK_STATE_ROOT"/projects/$SLUG/*-$BRANCH-design-*.md 2>/dev/null | head -1)
 ```
 If `$PRIOR` exists, the new doc gets a `Supersedes:` field referencing it. This creates a revision chain — you can trace how a design evolved across office hours sessions.
 
-Write to `~/.gstack/projects/{slug}/{user}-{branch}-design-{datetime}.md`.
+Write to `<PROJECT_DIR>/{user}-{branch}-design-{datetime}.md` (`PROJECT_DIR` printed by the setup block above).
 
-**Repo copy (dual-write, #703 + #2000).** When the session runs inside a git
+**Repo copy (dual-write).** When the session runs inside a git
 repository, ALSO write the doc to `docs/designs/{topic-slug}.md` in the repo —
 visible, committable, team-shareable. The `~/.gstack` copy is still written
 (memory ingest and cross-session discovery depend on it); the repo copy is
@@ -36,7 +38,7 @@ what teammates and plan reviews read. Rules:
 3. **Name the repo path** in the handoff line and any approval questions when
    the repo copy exists — that's the copy the user can open and commit.
 
-**Decision-record concision (#2000).** The doc is a decision record, not a
+**Decision-record concision.** The doc is a decision record, not a
 transcript: one bullet per decision with its why; an approach the user ruled
 out DURING the session gets one line (name + rejection reason), never a
 resurrected full section that re-argues the case; omit template sections that
@@ -166,67 +168,101 @@ Supersedes: {prior filename — omit this line if first design on this branch}
 
 ## Spec Review Loop
 
-Before presenting the document to the user for approval, run an adversarial review.
+Run an adversarial review before presenting the final document to the user.
+Follow the calling workflow's approval steps.
+The reviewer's saved JSON is the complete verdict. A prose summary is not a second
+finding inventory: the report helper preserves every problem/remedy and counts the
+records mechanically. Do not rewrite, condense, deduplicate, or recount its blocks.
 
-**Step 1: Dispatch reviewer subagent**
+**Step 1: Prepare and dispatch the reviewer**
 
-Use the Agent tool to dispatch an independent reviewer, passing `run_in_background: false`
-(subagents default to background since Claude Code v2.1.198; this loop consumes the
-reviewer's verdict). The reviewer has fresh context
-and cannot see the brainstorming conversation — only the document. This ensures genuine
-adversarial independence.
+Create a fresh review directory next to the design:
 
-Prompt the subagent with:
-- The file path of the document just written
-- "Read this document and review it on 5 dimensions. For each dimension, note PASS or
-  list specific issues with suggested fixes. At the end, output a quality score (1-10)
-  across all dimensions."
+```bash
+mktemp -d "<design-path>.review.XXXXXX"
+```
+Remember its actual path for this invocation. Keep these evidence files with the design.
+Maximum 3 iterations total. Before EACH dispatch, generate the complete prompt using
+all preceding valid round files in order (omit them for round 1):
 
-**Dimensions:**
-1. **Completeness** — Are all requirements addressed? Missing edge cases?
-2. **Consistency** — Do parts of the document agree with each other? Contradictions?
-3. **Clarity** — Could an engineer implement this without asking questions? Ambiguous language?
-4. **Scope** — Does the document creep beyond the original problem? YAGNI violations?
-5. **Feasibility** — Can this actually be built with the stated approach? Hidden complexity?
+```bash
+~/.claude/skills/gstack/bin/gstack-office-hours-review prepare --design "<design-path>" --out-dir "<review-directory>" "<round-1.json if present>" "<round-2.json if present>"
+```
 
-The subagent should return:
-- A quality score (1-10)
-- PASS if no issues, or a numbered list of issues with dimension, description, and fix
+Omit absent arguments rather than passing placeholders. The helper chooses the next
+round and writes `round-N.prompt.md`. It includes the full finding schema, all five
+review dimensions (Completeness, Consistency, Clarity, Scope, Feasibility), the
+office-hours coaching contract, and the COMPLETE preceding JSON verdict.
 
-**Step 2: Fix and re-dispatch**
+Use the Agent tool with `run_in_background: false` and its returned `dispatch`
+string unchanged as the prompt. The reviewer must Read the entire prepared prompt
+file before reviewing the design. Do not recreate the prompt, copy selected fields,
+or summarize prior findings. A parent Read does not deliver the file to the reviewer.
+The reviewer has fresh context and cannot see the brainstorming conversation.
+Its prepared contract requires a complete JSON Write and an identical JSON response.
+It protects the required coaching and Assignment sections, distinguishes unknown
+customer facts from committed behavior, and requires evidence for every prior status.
 
-If the reviewer returns issues:
-1. Fix each issue in the document on disk (use Edit tool)
-2. Re-dispatch the reviewer subagent with the updated document
-3. Maximum 3 iterations total
+**Step 2: Check stop conditions, then fix and re-dispatch**
 
-**Convergence guard:** If the reviewer returns the same issues on consecutive iterations
-(the fix didn't resolve them or the reviewer disagrees with the fix), stop the loop
-and persist those issues as "Reviewer Concerns" in the document rather than looping
-further.
+After each verdict, BEFORE fixing any findings or dispatching again, validate the
+saved files with the helper (list every completed round in order):
 
-If the subagent fails, times out, or is unavailable — skip the review loop entirely.
-Tell the user: "Spec review unavailable — presenting unreviewed doc." The document is
-already written to disk; the review is a quality bonus, not a gate.
+```bash
+~/.claude/skills/gstack/bin/gstack-office-hours-review check "<round-1.json>" "<round-2.json if present>" "<round-3.json if present>"
+```
+
+Omit absent arguments rather than passing placeholders.
+**Convergence guard and stopping rules:** Read its stop reason:
+- PASS: no unresolved findings; proceed to Step 3.
+- CONVERGENCE: the reviewer explicitly marked a prior obligation persisting with
+  a concrete prior/current finding pair and document evidence. Stop even if new
+  findings appear. Shared topic labels or new refinements alone are insufficient.
+- MAX_ITERATIONS: round 3 completed; stop.
+- CONTINUE: fix the listed findings in the design, then return to Step 1 to prepare and dispatch the next review.
+
+On a stop, do not fix again or re-dispatch. Run the finalizer before approval:
+
+```bash
+~/.claude/skills/gstack/bin/gstack-office-hours-review finalize --design "<design-path>" "<round-1.json>" "<round-2.json if present>" "<round-3.json if present>"
+```
+
+It installs the complete `## Reviewer Concerns` section directly from the JSON.
+Recording concerns does not mark them fixed. Do not edit that generated section.
+Then proceed to Step 3 and the existing user approval.
+
+If the subagent fails, times out, or is unavailable — stop the loop and present the
+document unreviewed. Tell the user: "Spec review unavailable — presenting unreviewed doc."
+A missing or invalid verdict is an explicit review failure, never PASS. Preserve the
+failed output and its error. Finalize with `--unreviewed "<actual failure cause>"`
+and only the preceding valid round files (none if round 1 failed); their known
+concerns remain visible. Do not fabricate JSON or hide a completed verdict behind
+UNREVIEWED. The independent review remains a quality bonus, not an approval gate.
 
 **Step 3: Report and persist metrics**
 
-After the loop completes (PASS, max iterations, or convergence guard):
+The finalizer prints the exact Spec Review block, quality score, and metrics. Tell the user the
+result using that block; link the design and saved verdicts for details. Report
+finding observations across rounds separately from unresolved final findings.
+Confirmed resolutions require explicit later reviewer evidence; attempted fix
+rounds are counted separately and never described as successful fixes.
 
-1. Tell the user the result — summary by default:
-   "Your doc survived N rounds of adversarial review. M issues caught and fixed.
-   Quality score: X/10."
-   If they ask "what did the reviewer find?", show the full reviewer output.
+When writing a completion report, write its other sections normally, then run the
+same finalizer with `--report "<report-path>"` after the report exists. This installs
+its authoritative `## Spec Review` section and Disposition mechanically. Do not
+summarize or replace that section afterward; refer to it elsewhere instead of
+inventing duplicate counts. Preserve the Assignment, coaching, approval, and Handoff.
 
-2. If issues remain after max iterations or convergence, add a "## Reviewer Concerns"
-   section to the document listing each unresolved issue. Downstream skills will see this.
-
-3. Append metrics:
+Append the helper's actual metrics to the existing analytics log (telemetry is
+best-effort and must not block approval):
 ```bash
-mkdir -p ~/.gstack/analytics
-echo '{"skill":"office-hours","ts":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","iterations":ITERATIONS,"issues_found":FOUND,"issues_fixed":FIXED,"remaining":REMAINING,"quality_score":SCORE}' >> ~/.gstack/analytics/spec-review.jsonl 2>/dev/null || true
+GSTACK_STATE_ROOT=$(~/.claude/skills/gstack/bin/gstack-paths --get GSTACK_STATE_ROOT); : "${GSTACK_STATE_ROOT:?gstack-paths failed; reinstall with ./setup or /gstack-upgrade}"
+mkdir -p "$GSTACK_STATE_ROOT/analytics"
+echo '{"skill":"office-hours","ts":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","iterations":ITERATIONS,"issues_found":FOUND,"issues_fixed":FIXED,"remaining":REMAINING,"quality_score":SCORE}' >> "$GSTACK_STATE_ROOT/analytics/spec-review.jsonl" 2>/dev/null || true
 ```
-Replace ITERATIONS, FOUND, FIXED, REMAINING, SCORE with actual values from the review.
+Use iterations, issues_found, issues_fixed, remaining, and quality_score from the
+helper. FOUND counts finding observations across rounds; FIXED counts only
+reviewer-confirmed resolutions. An unavailable score is null, never invented.
 
 ---
 
@@ -237,25 +273,15 @@ Present the reviewed design doc to the user via AskUserQuestion:
 
 
 
-## Brain Calibration Write-Back (Phase 2 / gated)
+## Brain Calibration Write-Back (gated)
 
-When the skill makes a typed prediction worth tracking (scope decision,
-TTHW target, architectural bet, wedge commitment), it MAY write a
-`kind=bet` take to the brain so a calibration profile builds over time.
+Skip unless `BRAIN_CALIBRATION_WRITEBACK` is set and the preamble/brain-health
+output or gstack config shows `brain_trust_policy@<endpoint-hash>=personal`.
+If unknown, skip. If both gates pass, record one durable
+typed prediction with `mcp__gbrain__takes_add`; if unavailable, use
+`mcp__gbrain__put_page` with a gstack:takes fence block.
 
-**Gated on two things:**
-1. Brain trust policy for the active endpoint is `personal` (check via
-   `~/.claude/skills/gstack/bin/gstack-config get brain_trust_policy@<endpoint-hash>`).
-   Shared brains skip write-back to avoid polluting team calibration.
-2. Feature flag `BRAIN_CALIBRATION_WRITEBACK` is set (today: false; flips
-   to true when upstream gbrain v0.42+ ships `takes_add` MCP op).
-
-When both gates pass, the write-back path uses `mcp__gbrain__takes_add`
-to record a take with weight 0.9 (per SKILL_CALIBRATION_WEIGHTS).
-If the MCP op is unavailable, fall back to `mcp__gbrain__put_page` with
-a gstack:takes fence block (documented but uglier path).
-
-Mandatory take frontmatter shape:
+Take frontmatter:
 ```yaml
 kind: bet
 holder: <user identity from whoami>
@@ -266,16 +292,14 @@ expected_resolution: <date in 1-3 months depending on skill>
 source_skill: office-hours
 ```
 
-After write, invalidate the affected digests so the next preflight reflects
-the new state:
+After write, invalidate affected digests:
 
 ```bash
-eval "$(~/.claude/skills/gstack/bin/gstack-slug 2>/dev/null)" 2>/dev/null || true
+SLUG=$(~/.claude/skills/gstack/bin/gstack-slug --get SLUG 2>/dev/null) || true
   ~/.claude/skills/gstack/bin/gstack-brain-cache invalidate product --project "$SLUG" 2>/dev/null || true
   ~/.claude/skills/gstack/bin/gstack-brain-cache invalidate goals --project "$SLUG" 2>/dev/null || true
   ~/.claude/skills/gstack/bin/gstack-brain-cache invalidate competitive-intel --project "$SLUG" 2>/dev/null || true
 ```
-
 
 ## Brain Cache Background Refresh
 
@@ -285,7 +309,7 @@ This is non-blocking — the user doesn't wait. Next invocation benefits
 from the warm cache.
 
 ```bash
-eval "$(~/.claude/skills/gstack/bin/gstack-slug 2>/dev/null)" 2>/dev/null || true
+SLUG=$(~/.claude/skills/gstack/bin/gstack-slug --get SLUG 2>/dev/null) || true
 (~/.claude/skills/gstack/bin/gstack-brain-cache refresh --project "$SLUG" 2>/dev/null &) || true
 ```
 
@@ -425,11 +449,12 @@ Design trajectory with interpretation:
 "You started this as a side project. But you've named specific users, pushed back when challenged, and your designs keep getting sharper each time. I don't think this is a side project anymore. Have you thought about whether this could be a company?"
 This must feel earned, not broadcast. If the evidence doesn't support it, skip entirely.
 
-**Builder Journey Summary** (session 5+): Auto-generate `~/.gstack/builder-journey.md`
-with a narrative arc (not a data table). The arc tells the STORY of their journey in
-second person, referencing specific things they said across sessions. Then open it:
+**Builder Journey Summary** (session 5+): Auto-generate `builder-journey.md` in the
+gstack state root (`$GSTACK_STATE_ROOT`, resolved by the block below) with a narrative
+arc (not a data table). The arc tells the STORY of their journey in second person,
+referencing specific things they said across sessions. Then open it:
 ```bash
-eval "$(~/.claude/skills/gstack/bin/gstack-paths)"
+GSTACK_STATE_ROOT=$(~/.claude/skills/gstack/bin/gstack-paths --get GSTACK_STATE_ROOT); : "${GSTACK_STATE_ROOT:?gstack-paths failed; reinstall with ./setup or /gstack-upgrade}"
 open "$GSTACK_STATE_ROOT/builder-journey.md"
 ```
 
@@ -445,7 +470,7 @@ The data speaks. No pitch needed.
 
 Full accumulated signal summary from the profile.
 
-Auto-generate updated `~/.gstack/builder-journey.md` with narrative arc. Open it.
+Auto-generate updated `$GSTACK_STATE_ROOT/builder-journey.md` with narrative arc (resolve the state root and open it as in the regular tier).
 
 Then proceed to Founder Resources below.
 
@@ -453,7 +478,7 @@ Then proceed to Founder Resources below.
 
 ### Founder Resources (all tiers)
 
-**Standing opt-out check (#538) — run FIRST:**
+**Standing opt-out check — run FIRST:**
 
 ```bash
 ~/.claude/skills/gstack/bin/gstack-config get founder_resources 2>/dev/null || echo "true"
@@ -555,14 +580,15 @@ PAUL GRAHAM ESSAYS:
 1. Log the selected resource URLs to the builder profile (single source of truth).
 Append a resource-tracking entry:
 ```bash
-eval "$(~/.claude/skills/gstack/bin/gstack-slug 2>/dev/null || true)"
+SLUG=$(~/.claude/skills/gstack/bin/gstack-slug --get SLUG 2>/dev/null) || true
 ~/.claude/skills/gstack/bin/gstack-developer-profile --log-session '{"date":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'","mode":"resources","project_slug":"'"${SLUG:-unknown}"'","signal_count":0,"signals":[],"design_doc":"","assignment":"","resources_shown":["URL1","URL2","URL3"],"topics":[]}' 2>/dev/null || true
 ```
 
 2. Log the selection to analytics:
 ```bash
-mkdir -p ~/.gstack/analytics
-echo '{"skill":"office-hours","event":"resources_shown","count":NUM_RESOURCES,"categories":"CAT1,CAT2","ts":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"}' >> ~/.gstack/analytics/skill-usage.jsonl 2>/dev/null || true
+GSTACK_STATE_ROOT=$(~/.claude/skills/gstack/bin/gstack-paths --get GSTACK_STATE_ROOT); : "${GSTACK_STATE_ROOT:?gstack-paths failed; reinstall with ./setup or /gstack-upgrade}"
+mkdir -p "$GSTACK_STATE_ROOT"/analytics
+echo '{"skill":"office-hours","event":"resources_shown","count":NUM_RESOURCES,"categories":"CAT1,CAT2","ts":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"}' >> "$GSTACK_STATE_ROOT"/analytics/skill-usage.jsonl 2>/dev/null || true
 ```
 
 3. Use AskUserQuestion to offer opening the resources:
@@ -620,13 +646,14 @@ D) Not now — I'll run a review later
 Net: 15 minutes of structured review now against rework risk later.
 
 On the user's SELECTION of A/B/C (not on invocation success), log the handoff, then invoke
-the chosen skill via the **Skill tool** (it auto-discovers the design doc):
+the chosen skill via the **Skill tool** (it auto-discovers the design doc). In both log
+commands, replace `SESSION_ID` with the value the skill-start output echoed:
 ```bash
-~/.claude/skills/gstack/bin/gstack-telemetry-log --event-type handoff --skill office-hours --outcome accepted --session-id "$_SESSION_ID" 2>/dev/null || true
+~/.claude/skills/gstack/bin/gstack-telemetry-log --event-type handoff --skill office-hours --outcome accepted --session-id "SESSION_ID" 2>/dev/null || true
 ```
 On D, log declined and stop:
 ```bash
-~/.claude/skills/gstack/bin/gstack-telemetry-log --event-type handoff --skill office-hours --outcome declined --session-id "$_SESSION_ID" 2>/dev/null || true
+~/.claude/skills/gstack/bin/gstack-telemetry-log --event-type handoff --skill office-hours --outcome declined --session-id "SESSION_ID" 2>/dev/null || true
 ```
 
 The design doc at `~/.gstack/projects/` is automatically discoverable by downstream skills — they will read it during their pre-review system audit.

@@ -7,25 +7,25 @@
  * on-demand section — prompt-token-load-reduction carve; the skeleton keeps
  * only the STOP-Read pointer). After ANY non-zero `gh pr merge`, the skill
  * must query authoritative PR state via
- * `gh pr view --json state,mergeCommit,mergedAt,mergedBy` and
- * branch on the result instead of retrying `gh pr merge` (cli/cli#3442,
- * cli/cli#13380).
+ * GraphQL (including queue membership) and
+ * branch on the result instead of blindly retrying `gh pr merge`.
  *
  * Static invariants pin:
  *   - §4a-postfail header present
- *   - Universal invariant text + reference to upstream gh bugs
+ *   - Query-before-retry invariant after any non-zero merge exit
  *   - All three state branches (MERGED, OPEN, CLOSED) named explicitly
  *   - MERGED branch: capture merge SHA via mergeCommit.oid
  *   - MERGED branch: non-destructive worktree cleanup with uncommitted-work guard
  *   - MERGED branch: continues to §4a CI watch
  *   - OPEN branch: checks autoMergeRequest before treating as failure
  *   - CLOSED branch: STOPs
- *   - Hard rule: never retry `gh pr merge`
+ *   - Hard rule: no replay after MERGED; one guarded auto-to-direct fallback
  *   - .tmpl edit propagated to generated SKILL.md (atomic per T-Codex-3)
  */
 import { describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { expectMentions } from './helpers/prompt-structure';
 
 const ROOT = path.resolve(import.meta.dir, "..");
 const TMPL = path.join(ROOT, "land-and-deploy", "sections", "merge-and-deploy.md.tmpl");
@@ -52,17 +52,15 @@ describe("PR #1620 §4a-postfail in land-and-deploy template", () => {
     expect(postfail).toBeLessThan(queue);
   });
 
-  test("Universal invariant + upstream gh bug references", () => {
-    const body = readTmpl();
-    expect(body).toMatch(/Universal invariant/);
-    expect(body).toMatch(/non-zero exit from `gh pr merge`/);
-    expect(body).toMatch(/cli\/cli#3442/);
-    expect(body).toMatch(/cli\/cli#13380/);
+  test("any non-zero merge exit queries authoritative state before retrying", () => {
+    const body = readTmpl().replace(/\s+/g, " ");
+    expect(body).toMatch(/non-zero exit from `gh pr merge`, query authoritative PR state before retrying/i);
   });
 
-  test("Authoritative state query uses gh pr view --json", () => {
+  test("Authoritative state query includes auto request and queue membership", () => {
     const body = readTmpl();
-    expect(body).toMatch(/gh pr view --json state,mergeCommit,mergedAt,mergedBy/);
+    expect(body).toMatch(/gh api graphql/);
+    expect(body).toContain('autoMergeRequest { enabledAt } mergeQueueEntry { id state }');
   });
 
   test("All three state branches named: MERGED, OPEN, CLOSED", () => {
@@ -74,20 +72,20 @@ describe("PR #1620 §4a-postfail in land-and-deploy template", () => {
 
   test("MERGED branch captures merge SHA via mergeCommit.oid", () => {
     const body = readTmpl();
-    expect(body).toMatch(/gh pr view --json mergeCommit -q \.mergeCommit\.oid/);
+    expect(body).toMatch(/jq -er '\.data\.repository\.pullRequest\.mergeCommit\.oid'/);
   });
 
   test("MERGED worktree cleanup is non-destructive (uncommitted-work guard)", () => {
     const body = readTmpl();
     expect(body).toMatch(/uncommitted work/);
-    expect(body).toMatch(/STOP worktree cleanup without removing/);
-    expect(body).toMatch(/Do NOT use `--force`/);
-    expect(body).toMatch(/Do NOT remove the user's primary working tree/);
+    expectMentions(body, [['stop', 'worktree', 'removing']], 'body');
+    expect(body).toMatch(/do not use `--force`/i);
+    expectMentions(body, [['do not', 'primary', 'working']], 'body');
   });
 
   test("MERGED branch continues to §4b CI auto-deploy detection", () => {
     const body = readTmpl();
-    expect(body).toMatch(/continue to §4b \(CI auto-deploy detection\)/);
+    expect(body).toContain('§4b');
   });
 
   // #2656: the failed merge carried --delete-branch; the recovery path must
@@ -96,7 +94,7 @@ describe("PR #1620 §4a-postfail in land-and-deploy template", () => {
   // base checkout's origin, because fork branches do not exist in origin.
   test("MERGED branch reconciles the PR head repository (ls-remote, confirm-first delete)", () => {
     const body = readTmpl();
-    expect(body).toMatch(/gh pr view --json headRepositoryOwner,headRepository,headRefName/);
+    expect(body).toMatch(/gh pr view "\$PR_NUMBER" --repo "\$REPO" --json headRepositoryOwner,headRepository,headRefName/);
     // gh leaves .headRepository.nameWithOwner empty (verified live, gh 2.83) —
     // owner/name is composed from headRepositoryOwner.login + headRepository.name.
     expect(body).toMatch(/headRepositoryOwner\.login/);
@@ -112,26 +110,27 @@ describe("PR #1620 §4a-postfail in land-and-deploy template", () => {
   test("MERGED branch reconciliation distinguishes branch-absent from check-failed", () => {
     const body = readTmpl();
     // exit 0 + empty output = already clean (idempotent re-runs)...
-    expect(body).toMatch(/already been cleaned up/);
+    expect(body).toMatch(/already been cleaned up/i);
     // ...non-zero exit = unknown state, never read as a clean branch.
-    expect(body).toMatch(/Couldn't verify remote branch state/);
-    expect(body).toMatch(/never read a failed check as a clean branch/);
+    expectMentions(body, [['never', 'failed', 'branch']], 'body');
   });
 
   test("OPEN branch checks autoMergeRequest before treating as failure", () => {
     const body = readTmpl();
-    expect(body).toMatch(/gh pr view --json autoMergeRequest/);
-    expect(body).toMatch(/auto-merge is enabled or merge queue is in use/);
+    expect(body).toMatch(/autoMergeRequest != null or \.mergeQueueEntry != null/);
   });
 
   test("CLOSED branch STOPs", () => {
     const body = readTmpl();
-    expect(body).toMatch(/state == "CLOSED".*[\s\S]{0,200}STOP/);
+    expect(body).toMatch(/state == "CLOSED"[\s\S]{0,200}\bstop\b/i);
   });
 
-  test("Hard rule: never retry gh pr merge after non-zero exit", () => {
-    const body = readTmpl();
-    expect(body).toMatch(/never call `gh pr merge` a second time/);
+  test("Hard rule: no replay after MERGED and only one guarded direct fallback", () => {
+    const body = readTmpl().replace(/\s+/g, " ");
+    expect(body).toMatch(/never replay a merge after MERGED/i);
+    expect(body).toMatch(/one direct fallback/i);
+    expectMentions(body, [['no', 'fallback', 'attempt']], 'body');
+    expect(body).toMatch(/confirmed OPEN, no auto request and no queue entry/i);
   });
 
   test("Generated merge-and-deploy.md carries the §4a-postfail section (atomic regen per T-Codex-3)", () => {

@@ -58,13 +58,16 @@ const MANDATORY: Array<{ name: string; re: RegExp }> = [
  * these into a section (they fire only once the section is loaded), but they
  * must never be DROPPED. Asserted against the skeleton+sections union. */
 const PER_SKILL_RULES: Record<string, RegExp[]> = {
-  'plan-ceo-review': [/One issue = one AskUserQuestion call/i],
-  'plan-eng-review': [/One issue = one AskUserQuestion call/i],
+  'plan-ceo-review': [/One decision unit = one AskUserQuestion call/i],
+  'plan-eng-review': [/one\s+question object for one choice/i, /independently selectable changes separate IDs/i],
   'plan-design-review': [/One issue = one AskUserQuestion call/i],
-  'plan-devex-review': [/One issue = one AskUserQuestion call/i],
-  // /codex emits its recommendation as prose; the instruction MUST stay in the
+  'plan-devex-review': [
+    /One new or reopened decision = one AskUserQuestion call/i,
+    /Never combine independent decisions, including in separate question tabs/i,
+  ],
+  // /codex emits its recommendation as prose; the instruction must stay in the
   // always-loaded skeleton because codex has no on-demand section.
-  codex: [/Synthesis recommendation \(REQUIRED\)/i, /Recommendation\s*:\s*<action>\s*because/i],
+  codex: [/Synthesis recommendation/i, /Recommendation\s*:\s*<action>\s*because/i],
 };
 
 /** Discover every repo-root skill dir that ships a generated SKILL.md. */
@@ -107,7 +110,8 @@ const EXPECTED_INTERACTIVE = [
   'qa-only',
   'codex',
   'autoplan',
-  'cso',
+  // CSO uses a private startup and intentionally omits the shared PREAMBLE,
+  // including its generic AskUserQuestion formatting block.
   'investigate',
   'retro',
   'design-review',

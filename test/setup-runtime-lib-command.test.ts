@@ -1,8 +1,9 @@
 import { describe, test, expect } from 'bun:test';
-import { spawnSync } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
+import { runCapturedCommand } from './helpers/sync-command-capture';
+import { gitIn } from './helpers/scratch-repo';
 
 const ROOT = path.resolve(import.meta.dir, '..');
 const SETUP_SRC = fs.readFileSync(path.join(ROOT, 'setup'), 'utf-8');
@@ -33,8 +34,8 @@ function extractFunction(name: string): string {
 // root assignment through the last runtime-asset link so the extracted code is
 // a complete statement list.
 function extractKiroBlock(): string {
-  const startAnchor = 'KIRO_GSTACK="$KIRO_SKILLS/gstack"';
-  const endAnchor = '_link_or_copy "$SOURCE_GSTACK_DIR/supabase/config.sh" "$KIRO_GSTACK/supabase/config.sh"\n  fi';
+  const startAnchor = 'mkdir -p "$KIRO_GSTACK" "$KIRO_GSTACK/browse" "$KIRO_GSTACK/gstack-upgrade" "$KIRO_GSTACK/review"';
+  const endAnchor = '_link_or_copy "$SOURCE_GSTACK_DIR/supabase/config.sh" "$KIRO_GSTACK/supabase/config.sh"\n    fi';
   const start = SETUP_SRC.indexOf(startAnchor);
   const end = SETUP_SRC.indexOf(endAnchor, start);
   if (start < 0 || end < 0) throw new Error('Could not locate the Kiro install block in setup');
@@ -49,6 +50,8 @@ interface CommandResult {
   learningsWritten: boolean;
   libIsSymlink: boolean | null;
   supabaseConfigPresent: boolean;
+  reviewStatus: number | null;
+  reviewFreshness?: string;
 }
 
 // Build one host runtime root inside a sandbox using the real setup shell code
@@ -66,19 +69,34 @@ function buildRootAndRunCommand(
     fs.mkdirSync(project, { recursive: true });
 
     const { script, rootDir } = buildScript(sandbox);
-    const build = spawnSync(
-      'bash',
-      ['-c', `IS_WINDOWS=${isWindows}\n${extractFunction('_link_or_copy')}\n${script}`],
-      { encoding: 'utf-8', timeout: 30000 },
+    const build = runCapturedCommand(
+      'bash', ['-c', `IS_WINDOWS=${isWindows}\n${extractFunction('_link_or_copy')}\n${script}`],
+      { timeout: 30000 },
     );
 
     const libLst = fs.lstatSync(path.join(rootDir, 'lib'), { throwIfNoEntry: false });
-    const run = spawnSync('bash', [path.join(rootDir, 'bin', 'gstack-learnings-log'), PAYLOAD], {
+    const run = runCapturedCommand('bash', [path.join(rootDir, 'bin', 'gstack-learnings-log'), PAYLOAD], {
       cwd: project,
-      encoding: 'utf-8',
       timeout: 30000,
       env: { ...process.env, HOME: home, GSTACK_HOME: path.join(home, '.gstack') },
     });
+
+    gitIn(project, 'init -q');
+    fs.writeFileSync(path.join(project, 'source.txt'), 'reviewed content\n');
+    gitIn(project, 'add source.txt');
+    gitIn(project, 'commit -qm initial');
+    const review = runCapturedCommand('bash', ['-c', `
+set -e
+TOKEN=$("$1/bin/gstack-review-log" --start review)
+"$1/bin/gstack-review-log" '{"skill":"review","status":"clean","completed":true,"converged":true}' --finish "$TOKEN"
+"$1/bin/gstack-review-read"
+`, 'review-runtime', rootDir], {
+      cwd: project,
+      captureStdout: true,
+      timeout: 30000,
+      env: { ...process.env, HOME: home, GSTACK_HOME: path.join(home, '.gstack') },
+    });
+    const reviewRow = review.stdout.split('\n').find(line => line.startsWith('{'));
 
     const projectsDir = path.join(home, '.gstack', 'projects');
     const learningsWritten = fs.existsSync(projectsDir)
@@ -99,6 +117,8 @@ function buildRootAndRunCommand(
       // [ -f ... ] guard means a missing file degrades SILENTLY, so only a
       // presence check on the installed root catches it.
       supabaseConfigPresent: fs.existsSync(path.join(rootDir, 'supabase', 'config.sh')),
+      reviewStatus: review.status,
+      reviewFreshness: reviewRow ? JSON.parse(reviewRow).review_freshness?.status : undefined,
     };
   } finally {
     fs.rmSync(sandbox, { recursive: true, force: true });
@@ -143,6 +163,7 @@ const HOST_ROOTS: Record<string, (sandbox: string) => { script: string; rootDir:
       `HOME="${sandbox}/home"`,
       `SOURCE_GSTACK_DIR="${ROOT}"`,
       `KIRO_SKILLS="$HOME/.kiro/skills"`,
+      `KIRO_GSTACK="$KIRO_SKILLS/gstack"`,
       `mkdir -p "$KIRO_SKILLS"`,
       extractKiroBlock(),
     ].join('\n'),
@@ -159,23 +180,27 @@ describe.skipIf(process.platform === 'win32')('setup: bin commands resolve sibli
   for (const [host, buildScript] of Object.entries(HOST_ROOTS)) {
     test(`${host} root (symlink install): gstack-learnings-log imports ../lib and writes the learning`, () => {
       const r = buildRootAndRunCommand('0', buildScript);
-      expect(r.buildStatus).toBe(0);
+      expect(r.buildStatus, r.buildStderr).toBe(0);
       expect(r.libIsSymlink).toBe(true);
       expect(r.runStderr).not.toContain('lib/jsonl-store.ts');
-      expect(r.runStatus).toBe(0);
+      expect(r.runStatus, r.runStderr).toBe(0);
       expect(r.learningsWritten).toBe(true);
       expect(r.supabaseConfigPresent).toBe(true);
+      expect(r.reviewStatus).toBe(0);
+      expect(r.reviewFreshness).toBe('CURRENT');
     });
 
     test(`${host} root (Windows copy install): gstack-learnings-log imports ../lib and writes the learning`, () => {
       const r = buildRootAndRunCommand('1', buildScript);
-      expect(r.buildStatus).toBe(0);
+      expect(r.buildStatus, r.buildStderr).toBe(0);
       // Windows branch copies: lib must be a real directory, not a symlink.
       expect(r.libIsSymlink).toBe(false);
       expect(r.runStderr).not.toContain('lib/jsonl-store.ts');
-      expect(r.runStatus).toBe(0);
+      expect(r.runStatus, r.runStderr).toBe(0);
       expect(r.learningsWritten).toBe(true);
       expect(r.supabaseConfigPresent).toBe(true);
+      expect(r.reviewStatus).toBe(0);
+      expect(r.reviewFreshness).toBe('CURRENT');
     });
   }
 
@@ -194,5 +219,7 @@ describe.skipIf(process.platform === 'win32')('setup: bin commands resolve sibli
     expect(r.runStatus).not.toBe(0);
     expect(r.runStderr).toContain('lib/jsonl-store.ts');
     expect(r.learningsWritten).toBe(false);
+    expect(r.reviewStatus).not.toBe(0);
   });
+
 });

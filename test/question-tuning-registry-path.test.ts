@@ -17,6 +17,7 @@ import * as path from 'path';
 import { HOST_PATHS } from '../scripts/resolvers/types';
 import type { TemplateContext } from '../scripts/resolvers/types';
 import { generateQuestionTuning } from '../scripts/resolvers/question-tuning';
+import { expectMentions } from './helpers/prompt-structure';
 
 const ROOT = path.join(import.meta.dir, '..');
 
@@ -47,6 +48,15 @@ describe('question-tuning registry path is absolute (#2489)', () => {
       // A backtick immediately before `scripts/` means the path renders
       // relative — exactly the shape that never resolves from a project cwd.
       expect(out).not.toContain('`scripts/question-registry.ts`');
+    }
+  });
+
+  test('question identity covers prose and ad hoc IDs without enabling disabled tuning', () => {
+    for (const host of ['claude', 'codex'] as const) {
+      const out = generateQuestionTuning(makeCtx(host));
+      expect(out).toContain('skip entirely if `QUESTION_TUNING: false`');
+      expectMentions(out, [['before', 'conductor/fallback', 'askuserquestion']], 'out');
+      expect(out).toContain('`<gstack-qid:{question_id}>` once in the question text itself');
     }
   });
 

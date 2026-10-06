@@ -25,7 +25,7 @@ second half of this document is its complete reference.
 ### The driver contract
 
 Source of truth: [`scripts/resolvers/aside.ts`](scripts/resolvers/aside.ts). It
-renders `{{ASIDE_SETUP}}` into every browser skill's generated SKILL.md, and
+renders `{{ASIDE_SETUP}}` into browser instructions (conditionally for QA), and
 `test/aside-driver.test.ts` pins its load-bearing sentences. If this page and
 the resolver ever disagree, the resolver wins. The contract in one screen:
 
@@ -218,7 +218,7 @@ What changes when the fallback is active:
 
 | On Aside | On the fallback engine |
 |---|---|
-| Your sessions are already there | `/setup-browser-cookies` imports them from Chrome, Arc, Brave, Edge, or Comet — or log in once in headed mode |
+| Your sessions are already there | `/setup-browser-cookies` copies selected cookies from Chrome, Chromium, Brave, Edge, Windows-only Opera and Opera GX, or macOS-only Comet, Arc, and Dia; verify sign-in separately, or log in once in headed mode |
 | You watch the tabs the agent opens in Aside | `/open-gstack-browser` (or `$B connect`) shows the headed GStack Browser with the side panel |
 | Sign-in wall: sign in inside Aside, say "done" | `$B handoff` opens a visible Chrome at the same page; `$B resume` continues |
 | One `aside repl` script per flow, fresh session each time | Persistent daemon: cookies, tabs, and localStorage carry over between `$B` calls |
@@ -452,15 +452,22 @@ for the full design + decision trail.
    daemon (tabs, cookies, and logins are lost). `browse stop` against a
    daemon that already died is success: the desired end state holds, so it
    cleans the stale state file instead of booting a daemon just to stop it —
-   and reaps the headless Chromium child recorded in that state file if one
-   survived. The reap verifies the recorded start time AND a Chromium-looking
-   cmdline before sending any signal, so a recycled PID is never killed.
+   and attempts to reap a surviving headless Chromium child when the state
+   file contains its recorded identity. The reap checks the start time AND a
+   Chromium-looking cmdline before sending any signal. Production identity
+   capture remains unfixed: the existing Playwright `Browser.process()`
+   assumption does not supply that record. Tests with supplied identities
+   verify cleanup, not real-launch identity capture.
 
 ### Multi-workspace isolation
 
 Each project root (detected via `git rev-parse --show-toplevel`) gets its
-own daemon, port, state file, cookies, and logs. No cross-workspace
-collisions. State at `<project>/.gstack/browse.json`.
+own daemon, port, state file, and logs. Headless sessions have separate
+cookie stores; headed sessions still share the default Chromium profile.
+Headless startup, stop, disconnect, and shutdown leave that profile's locks
+and their holder alone. Headed launches retain stale-lock cleanup, and
+headed-versus-headed arbitration is unchanged. State lives at
+`<project>/.gstack/browse.json`.
 
 | Workspace | State file | Port |
 |-----------|-----------|------|
@@ -523,7 +530,7 @@ from `snapshot`, or `@c` refs from `snapshot -C`. Full table:
 | `fill <sel> <val>` | Fill input |
 | `select <sel> <val>` | Select dropdown option (value, label, or visible text) |
 | `hover <sel>` | Hover element |
-| `type <text>` | Type into focused element |
+| `type [--selector <sel>] [--] <text>` | Type into the focused element, or into `<sel>` with `--selector`; put text that starts with `--` after `--`. Bare `type` hints when its first word looks like a selector |
 | `press <key>` | Playwright keyboard key (case-sensitive: Enter, Tab, ArrowUp, Shift+Enter, Control+A, ...) |
 | `scroll [sel\|@ref]` | Scroll element into view, or jump to page bottom if no selector |
 | `viewport [<WxH>] [--scale <n>]` | Set viewport size + optional `deviceScaleFactor` 1-3 (retina screenshots) |
@@ -555,9 +562,58 @@ from `snapshot`, or `@c` refs from `snapshot -C`. Full table:
 |---------|-------------|
 | `cookie <name>=<value>` | Set cookie on current page domain |
 | `cookie-import <json>` | Import cookies from JSON file |
-| `cookie-import-browser [browser] [--domain d]` | Import from installed Chromium browsers (interactive picker, or `--domain` for direct import) |
+| `cookie-import-browser [browser] [--domain d] [--profile p] [--all] [--clear-storage] [--verify-auth]` | Copy selected browser cookies; picker by default, explicit scoped or all-domain import, optional storage reset and sign-in assertion |
 | `header <name>:<value>` | Set custom request header (sensitive values auto-redacted) |
 | `useragent <string>` | Set user agent (triggers context recreation, invalidates refs) |
+
+#### Choosing a source and checking sign-in
+
+Select the source browser and account/profile explicitly. The picker recognizes Chrome, Chromium, Brave, Edge, Windows-only Opera and Opera GX, and macOS-only Comet, Arc, and Dia. It shows current profile names from `Local State`, falling back to Preferences and then the directory name, with directory labels to distinguish duplicate names. `--profile` takes that directory (`Default`, `Profile 2`), not its display name. Without it, only a sole relevant profile is selected; ambiguity or unreadable profiles require a choice. The omitted-browser default remains `comet` for CLI compatibility, not as a recommendation. The picker opening link is one-use and expires after five minutes.
+
+For direct import, first navigate to a page matching `--domain`. Example after choosing Chrome's `Profile 2`:
+
+```bash
+$B goto https://example.com
+$B cookie-import-browser chrome --domain example.com --profile "Profile 2"
+```
+
+**Windows: Opera and Opera GX.** On Windows, Chrome, Edge and Brave increasingly store App-Bound Encryption cookies that gstack cannot decrypt; Opera and Opera GX still use DPAPI-protected cookies that it can. In Git Bash, with `$B` set as in the quick start above (the Windows build is `browse/dist/browse.exe`):
+
+```bash
+SITE=app.example.com
+DOMAIN=example.com
+$B goto "https://$SITE"
+$B cookie-import-browser opera-gx --domain "$DOMAIN" --profile Default   # or: opera
+$B reload                                                               # confirm the intended account
+```
+
+Run `$B cookie-import-browser` with no flags to see which browsers were detected. `--profile` can be omitted when only one profile has cookies for the domain. If the receipt reports App-Bound Encryption, run `$B handoff`, sign in to the intended account in the window that opens, then `$B resume` (needs a display).
+
+**Receipt failure reasons** (printed after the message as `Failure reasons: key=count`):
+
+| Key | Meaning | Next step |
+|---|---|---|
+| `unsupported_encryption` | App-Bound Encryption (v20) cookies gstack cannot decrypt | `$B handoff`, sign in, `$B resume` |
+| `decryption_failed` | The cookie could not be decrypted with the browser's key | Close the source browser and retry; otherwise sign in manually |
+| `native_unrecovered` | Windows native extraction ran but could not recover these cookies | Sign in manually with `$B handoff` |
+
+**Import errors:**
+
+| Code | Meaning | Next step |
+|---|---|---|
+| `not_installed` | No supported cookie database for that browser or profile; the message lists every path checked and, off-platform, which OS supports the browser | Pick a browser listed as available on this OS, or pass an existing `--profile` |
+| `profile_required` | Several profiles qualify, none has cookies for the domain, or a profile could not be read | Retry with `--profile "<dir>"` as the message suggests, or run `$B cookie-import-browser <browser>` to use the picker |
+| `native_unsupported_browser` | Internal guard; not expected in normal use | Sign in manually with `$B handoff` |
+
+The picker shows receipt messages verbatim; detailed `not_installed` and `profile_required` explanations appear in CLI output.
+
+`--all` explicitly selects every non-expired cookie in the chosen source profile; it cannot accompany `--domain` or `--clear-storage`. Cookies are applied to the captured browser context, not isolated to a tab. The receipt distinguishes imported, partial, empty, and failed results, plus separate storage-reset and authentication outcomes. Cookies copied with authentication `not_requested` means **not checked**, not logged in. Zero imports, cookie counts, and HTTP 200 alone never prove sign-in.
+
+`--verify-auth` (also an explicit picker checkbox) reloads the captured target. Configure `GSTACK_COOKIE_AUTH_SELECTOR` and `GSTACK_COOKIE_AUTH_EXPECTED_IDENTITY` privately in the **daemon environment before startup**; setting them only on a later CLI call does not reconfigure an existing daemon. Missing configuration rejects before mutation. Verification requires a successful same-origin response and exactly one visible element whose whitespace-normalized text equals the expected identity. A wrong account, login redirect, missing assertion, or changed target is not verified. Do not paste cookie values, passwords, profile/account labels, or expected identity into public logs; report only sanitized outcomes.
+
+Storage stays intact by default. With explicit approval on a Chromium target, `--clear-storage` clears localStorage for the captured origin (exact scheme, host, and port, shared across that origin's tabs in the context) and sessionStorage for the target tab before applying cookies. Reset runs in an isolated world with a native monotonic deadline, so the site's scripts cannot forge its timeout clock. Other target engines reject reset; ordinary imports and authentication checks remain available. It does not clear other origins, other tabs' sessionStorage, IndexedDB, or service workers. Keep the target open and unchanged. A failed reset may have cleared some storage; a later cookie-application failure does not undo it.
+
+**Platform limits:** macOS imports may request Keychain approval; Linux `v11` cookies may require libsecret, while `v10` uses Chromium's fallback key. The Windows Node server needs Node.js 22.13 or newer with built-in SQLite enabled for cookie database reads. DPAPI-compatible cookies remain supported, but native App-Bound Encryption extraction is disabled until the browser/runtime passes qualification. Opera and Opera GX are Windows-only and read from `%APPDATA%\Opera Software\Opera Stable` or `Opera GX Stable`, in `Default` or `Profile N` directories; legacy root-level layouts, Opera side profiles and portable or relocated installs are not detected. Opera has no native extraction, so its App-Bound cookies (if any) need manual sign-in. Chrome 136+ blocks remote debugging of its default user-data directory, including numbered profiles, over both pipe and TCP; closing Chrome does not remove that protection. There is no TCP fallback or real-profile-copy workaround. If import cannot recover the session, sign in manually in gstack's headed browser when a display is available.
 
 ### Tabs + frames
 
@@ -591,6 +647,8 @@ from `snapshot`, or `@c` refs from `snapshot -C`. Full table:
 | `status` | Daemon health + mode (headless / headed / cdp) |
 | `stop` | Shut down daemon (succeeds even if the daemon already died — never boots one just to stop it; reaps a surviving recorded headless Chromium after identity checks) |
 | `restart` | Restart daemon |
+| `profiles [list]` | List the per-project headed Chromium profiles: size, last use, and which browser holds each |
+| `profiles prune [--days N]` | Remove headed profiles idle for N days (default 30); never one a live browser holds |
 | `connect` | Launch headed GStack Browser with Side Panel extension |
 | `disconnect` | Close headed Chrome, return to headless |
 | `focus [@ref]` | Bring headed Chrome to foreground (macOS); `@ref` also scrolls into view |
@@ -829,6 +887,14 @@ with your tabs and bookmarks stays untouched.
 - **Debugging** where headless behavior differs from real Chrome
 - **Demos** where you're sharing your screen
 - **Pair-agent** sessions (the remote agent drives your local browser)
+
+Headed browse keeps one Chromium profile per project, at
+`<project>/.gstack/chromium-profile` (`CHROMIUM_PROFILE` still wins). The first
+headed start copies your logins from `~/.gstack/chromium-profile` when no browser
+is using it, and otherwise starts fresh and prints how to import. If a live
+browser already holds the project's profile, browse names it and stops instead
+of killing it. `browse profiles` lists the profiles; `browse profiles prune
+--days 30` removes idle ones.
 
 ### Aside and third-party drives (v1.72.0.0+)
 
@@ -1510,8 +1576,10 @@ No protocol. No schema. No connection management.
 ## Multi-workspace
 
 Each project root (detected via `git rev-parse --show-toplevel`) gets its
-own daemon, port, state file, cookies, and logs. No cross-workspace
-collisions.
+own daemon, port, state file, and logs. Headless sessions have separate
+cookie stores and leave the shared headed profile alone; two headed
+sessions still share the default profile. See [Multi-workspace isolation](#multi-workspace-isolation)
+for the cleanup boundary.
 
 | Workspace | State file | Port |
 |-----------|-----------|------|
@@ -1537,7 +1605,7 @@ the global `~/.gstack/browser-skills/foo/` only inside project-a.
 | `BROWSE_HEADLESS_SKIP` | 0 | Skip Chromium launch entirely (test harness only) |
 | `BROWSE_TUNNEL` | 0 | Activate the dual-listener tunnel architecture (requires `NGROK_AUTHTOKEN`) |
 | `BROWSE_TUNNEL_LOCAL_ONLY` | 0 | Test-only — bind both listeners locally without ngrok |
-| `CHROMIUM_PROFILE` | unset | Explicit Chromium profile directory (used by gbrowser's gbd per-workspace); honored by both launch and profile-lock cleanup |
+| `CHROMIUM_PROFILE` | unset | Explicit headed Chromium profile directory (used by gbrowser's gbd per-workspace); honored by headed launch and profile-lock cleanup, not used by headless sessions |
 | `GSTACK_DISABLE_GPU` | unset | Set to `off` to skip the macOS headless GPU-taming flag set (applied by default on Darwin to stop runaway GPU-process spin) |
 | `GSTACK_BROWSE_MAX_HTML_BYTES` | 52428800 (50MB) | `load-html` size cap |
 | `GSTACK_SECURITY_OFF` | unset | Emergency kill switch — disable ML classifier |
@@ -1596,6 +1664,12 @@ browse/
 │   ├── terminal-agent.ts        # Side Panel Claude PTY manager (auth + lifecycle)
 │   ├── sidebar-utils.ts         # Sidebar URL sanitization + helpers
 │   ├── cookie-import-browser.ts # Decrypt + import cookies from real Chromium browsers
+│   ├── cookie-database.ts       # Read-only Bun/Node SQLite with integer-safe cookie timestamps
+│   ├── cookie-import-operation.ts # Shared source selection, target policy, import receipts
+│   ├── cookie-auth-verification.ts # Opt-in target storage reset + exact identity assertion
+│   ├── cookie-import-native.ts  # Qualification-gated Windows pipe extraction adapter
+│   ├── cookie-import-native-worker.ts # Supervised native launch/read/cleanup
+│   ├── cookie-import-native-job.ts # Windows owned-process job boundary
 │   ├── cookie-picker-routes.ts  # HTTP routes for /cookie-picker/*
 │   ├── cookie-picker-ui.ts      # Self-contained HTML/CSS/JS for cookie picker
 │   ├── network-capture.ts       # Network request capture for $B network
@@ -1623,6 +1697,13 @@ skillify/SKILL.md.tmpl           # /skillify gstack skill — codify last /scrap
 ```
 
 ---
+
+## QA surfaces and setup
+
+QA uses this browser path only for selected browser surfaces. `/qa-only`, `/review`
+and `/ship` discovery never install the fallback browser or invoke cookie import;
+unavailable browser access blocks the affected probes. Standalone `/qa` may run
+setup or cookie import only after explicit approval.
 
 ## Development
 

@@ -11,7 +11,7 @@
  *
  * Consumers:
  *   - test/carve-section-ordering.test.ts   (E2, gate)  → staticInvariants
- *   - test/carve-section-loading.test.ts    (T2, periodic) → requiredReads + scenario
+ *   - test/carve-section-loading-*.test.ts    (T2, periodic) → requiredReads + scenario
  *   - test/carve-guard-completeness.test.ts (E1, gate)  → the set must equal the
  *                                                          filesystem carved set
  *   - test/carve-guards-negative.test.ts    (ET1, gate) → injects a broken fixture
@@ -77,8 +77,9 @@ export interface CarveGuard {
    *  - 'external' → covered by a dedicated bespoke test (complex fixtures, e.g.
    *                 ship's git/VERSION/CHANGELOG state). The data-driven loop
    *                 skips it; E1 asserts `externalTest` exists instead.
+   *  - 'none'     → no behavioral guard; the static invariants still apply.
    */
-  behavioral: 'plan' | 'prompt' | 'external';
+  behavioral: 'plan' | 'prompt' | 'external' | 'none';
   /** Required when behavioral === 'external': path (repo-relative) to the dedicated test. */
   externalTest?: string;
   /** Parity: max bytes for the always-loaded skeleton (asserts the carve shrank it). */
@@ -104,12 +105,14 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
       'test-coverage.md',
       'plan-completion.md',
       'review-army.md',
+      'shared-code-reuse.md',
       'greptile.md',
       'adversarial.md',
       'changelog.md',
+      'documentation.md',
       'pr-body.md',
     ],
-    requiredReads: ['review-army.md', 'changelog.md'],
+    requiredReads: ['review-army.md', 'changelog.md', 'documentation.md'],
     scenario:
       'This is a FRESH version-changing ship: the branch has a real code change, VERSION still equals the base version (needs a bump), and CHANGELOG.md needs a new entry. Follow the skill flow for a version-changing ship: run the pre-landing review and prepare the CHANGELOG entry. Produce the ship plan / review report. Do NOT actually commit, push, or open a PR.',
     staticInvariants: {
@@ -122,7 +125,7 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
       // one per touchpoint (no anchor is a substring of another, so each is
       // independently enforced — a subsumed anchor adds zero enforcement):
       //   gerund form  → manifest trigger (renders 2x: section index + STOP)
-      //   imperative   → Step 17 handoff line
+      //   mandatory handoff → Step 17 handoff line
       //   3rd person   → hoisted doc-sync invariant
       // Matching is case-sensitive String.includes — "dispatching the" does NOT
       // contain "dispatch the" — so update anchors in lockstep with any
@@ -130,8 +133,8 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
       mustStayInSkeleton: [
         'v$NEW_VERSION',
         'gstack-pr-title-rewrite',
-        'dispatching the /document-release subagent to sync docs',
-        'dispatch the /document-release subagent to sync docs',
+        '## Step 14.5: Documentation audit (every ship)',
+        'No documentation writer runs after push',
         'dispatches the /document-release subagent',
       ],
       // ...while the full create/update procedure stays carved into pr-body.md
@@ -163,7 +166,7 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
     // wave's headline capability) grows the union to 1.195x. Deliberate:
     // the section is on-demand (loads only for Apple store targets), so
     // per-invocation cost for non-iOS ships is one manifest line.
-    maxSizeRatio: 1.22,
+    maxSizeRatio: 1.428, // Shared advisory identity/dedup + critical-severity validation: 248,065 union bytes / 187,706 baseline = 1.3216 (2026-09-17). + test value bar in the lazy Step 7 section (value cards, weak paths, gate table, base control, machine checks; ~13.6KB): measured 1.396 (2026-09-29). + W1 guarded state-root resolution (`eval gstack-paths; : "${GSTACK_STATE_ROOT:?…}"`) in the Context Recovery preamble, the eureka log and each state-writing bash block; measured 1.401 (2026-09-30). + the shared QA review step's plan-check timing rule (plan checks and their revalidation run on --timeout-ms after smoke expiry); measured 1.4022 (2026-09-30). + the shared TEST_BOOTSTRAP owned-change undo rules (s03 H1-H3, M1) and the value-bar coverage wording (s03 M2/M3); measured 1.4044 (2026-10-02). + severe fix wave ship-review lane: G1 NO_VERSION dispatch, title and CHANGELOG arms (versionless repos ship without inventing a version), F1 parent-side plan binding before the audit dispatch (binding, docs/designs candidates, exact not-run line) and D3's data-not-instructions line; +2,126 union bytes, measured 1.4135 (2026-10-03). + INV-1 consumer lines (outside review `unverified`/`unavailable` is missing coverage in the readiness note and PR body); measured 1.4148 (2026-10-03). + v1.91.19.0 severe fix wave: verdict-form outside-review callers with sandbox preflight and first-use notice (INV-1/B1/Q2), P0/P1 gate and unverified wording, bound-plan discovery (F1), visible LEARNINGS failures (B5), carved external pointers; measured 267,752 / 187,706 = 1.4264 (2026-10-03). + v1.91.18.0 (#3023) merged into the v1.91.19.0 wave; measured 267,874 / 187,706 = 1.4271 (2026-10-04).
   },
   'plan-ceo-review': {
     skill: 'plan-ceo-review',
@@ -181,12 +184,12 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
     // v1.65 merge: provisional larger-of-both-waves budget; re-measured below.
         // Fork port wave 2 (#703): the repo-doc-preference block in the design
     // check grew every plan-review skeleton ~0.7KB. Measured values noted.
-    maxSkeletonBytes: 79_000, // + v2.0 {{ASIDE_RESEARCH}} (Aside first, WebSearch fallback); measured 77_657
+    maxSkeletonBytes: 80_850, // + depth-specific output and 0H/0I feasibility boundary clarity + the Aside probe's failure reason; measured 80,111. + W1 guarded state-root resolution (`eval gstack-paths; : "${GSTACK_STATE_ROOT:?…}"`) in the Context Recovery preamble, the eureka log and each state-writing bash block; measured 80,649 (2026-09-30); + the same guard in the CEO spec-review metrics block; measured 80,812 (2026-09-30).
     minUnionBytes: 123_600, // token-reduction Phases 1-2 (v1.69.x branch): preamble bash -> bin/gstack-skill-start, onboarding -> gated emission; measured union 137,346
     mustContain: ['SCOPE EXPANSION', 'SELECTIVE EXPANSION', 'HOLD SCOPE', 'SCOPE REDUCTION'],
     // Default-on Codex outside-voice (codexPreflight block + CODEX_MODE branch
     // prose replacing the smaller opt-in question) lands this ~5.2% over baseline.
-    maxSizeRatio: 1.08,
+    maxSizeRatio: 1.081, // + the Aside probe's failure reason; measured 1.0803
   },
   'plan-eng-review': {
     skill: 'plan-eng-review',
@@ -207,7 +210,7 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
     // check grew every plan-review skeleton ~0.7KB. Measured values noted.
     // #2499 project-scope MCP jq in the brain-sync block grew every tier-2+
     // skeleton ~1.5KB (entry resolution emitted once per SKILL.md).
-    maxSkeletonBytes: 56_500, // + v2.0 {{ASIDE_RESEARCH}} (Aside first, WebSearch fallback); measured 55_457
+    maxSkeletonBytes: 57_800, // Scoped reuse entry guidance; measured 57,549 bytes (2026-09-16). Shared rubric remains in the existing section.
     minUnionBytes: 99_800, // token-reduction Phases 1-2 (v1.69.x branch); measured union 110,910
     mustContain: ['Architecture', 'Code Quality', 'Test', 'Performance'],
     // Cross-cutting preamble growth (v1.57.2.0 AUQ-failure prose fallback + the
@@ -218,7 +221,7 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
     // 1.08 → 1.10: the scope-gate exceptions block (+ its adversarial-review
     // hardening: host-anchored mode signal, precedence, passing-mention
     // guards) and the plan-mode preamble reword land the union at 1.092.
-    maxSizeRatio: 1.12, // measured 1.103
+    maxSizeRatio: 1.175, // + clarity rules for saved decisions/setup gates + the Aside probe's failure reason; measured 1.1504. + test value bar and Tests to Retire in the lazy Test review section (~2.6KB); measured 1.168 + W1 guarded state-root resolution (`eval gstack-paths; : "${GSTACK_STATE_ROOT:?…}"`) in the Context Recovery preamble, the eureka log and each state-writing bash block; measured 1.173 (2026-09-30). + v1.91.12.0 merge of #2999 (headless rule: a disallowed question tool never qualifies) with #3002; measured 1.1741 (2026-10-01).
   },
   'plan-design-review': {
     skill: 'plan-design-review',
@@ -240,7 +243,7 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
     // tier-2+ skeleton (measured 89,184). Main's v1.64.0.0 adds ~340 B more
     // (telemetry --error-message/--failed-step preamble prose, PR #769).
     // Budget covers the sum of both waves.
-    maxSkeletonBytes: 73_800, // + v1.78 AUQ objectivity + v1.79 foreground-dispatch sweep (merged); measured 73_398
+    maxSkeletonBytes: 80_500, // Harness-aware outside voice: validated dispatch and provenance. + v1.91.19.0 wave: design --version probe (B4) and verdict-form outside voice (INV-1) on top of v1.91.17.0's round accounting (#3022); measured 80,443 (2026-10-03).
     minUnionBytes: 99_200, // token-reduction Phases 1-2 (v1.69.x branch); measured union 110,293
     mustContain: ['design', 'visual'],
     maxSizeRatio: 1.12, // D1 1.104 + main's ~0.008
@@ -264,7 +267,7 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
     // check grew every plan-review skeleton ~0.7KB. Measured values noted.
     // #2499 project-scope MCP jq in the brain-sync block grew every tier-2+
     // skeleton ~1.5KB (entry resolution emitted once per SKILL.md).
-    maxSkeletonBytes: 68_500, // + v2.0 {{ASIDE_RESEARCH}} (Aside first, WebSearch fallback); measured 67_129
+    maxSkeletonBytes: 68_550, // + v2.0 {{ASIDE_RESEARCH}} (Aside first, WebSearch fallback) + the Aside probe's failure reason; measured 68_544
     minUnionBytes: 99_700, // token-reduction Phases 1-2 (v1.69.x branch); measured union 110,833
     mustContain: ['developer experience', 'Getting Started'],
     // Default-on Codex outside-voice (codexPreflight block + CODEX_MODE branch
@@ -274,18 +277,68 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
   'office-hours': {
     skill: 'office-hours',
     expectedSections: ['design-and-handoff.md', 'phase-2a-startup-diagnostic.md', 'phase-2b-builder-brainstorm.md'],
-    // Phase sections are mode-exclusive (a session runs exactly one of 2A/2B),
-    // so only the always-reached design/handoff section is a deterministic read.
-    requiredReads: ['design-and-handoff.md'],
-    scenario:
-      'Run office hours for this product idea through to the end: have the diagnostic conversation, explore alternatives, then write the design doc and run the relationship handoff (Phases 5-6).',
+    // This fixture fixes startup mode; both its diagnostic and closing must run.
+    requiredReads: ['phase-2a-startup-diagnostic.md', 'design-and-handoff.md'],
+    scenario: `Run office hours in STARTUP mode through the diagnostic, premise challenge,
+alternatives, design document, spec review, approval, and relationship closing.
+This is a synthetic interview fixture, not a supplied implementation plan.
+
+Product idea: RosterCheck, a simpler way for adult craft-class organizers to turn
+registrations from two CSV exports into a correct printable check-in list.
+
+Use these founder answers for the diagnostic conversation. Challenge them, but do
+not invent customers, quotes, payments, or usage, or present proposed requirements
+as established founder answers. Anything not established below is unknown and can
+remain an open question or an assignment.
+- I run weekend ceramics workshops and can code. I have two weeks of evenings,
+  a $100 budget, and no team. There is no product or existing implementation.
+- I interviewed seven independent workshop organizers. Three shared redacted
+  sample exports and two asked to try a pilot at their next event. Nobody has
+  paid, committed to a price, or used a prototype. Interest is not proven demand.
+- Lee, the owner/instructor at Clay Room, is the first pilot candidate. Lee runs
+  classes of 10-30 adults and combines marketplace bookings with direct bookings
+  recorded in a spreadsheet. Lee said: "I just want to know nobody's missing
+  when I print the list." One booking was missed last month; no refund or lost
+  revenue has been established.
+- Today Lee copies the two exports into a spreadsheet, sorts names, checks
+  duplicates manually, and prints it. Lee reports about 30 minutes per event.
+  I have not watched this unaided or timed it myself; that baseline is unverified.
+- The initial pilot can use manual CSV exports for one organizer/event at a
+  time. Ambiguous duplicates need a human decision, never silent merging.
+  No provider API, payments, automatic emails, customer accounts, or hosted
+  customer data in this pilot. Keep attendee data local to the organizer.
+- Success to test: a correct list in under five minutes at three pilot events,
+  with every source booking accounted for and discrepancies checked by Lee.
+  Willingness to pay and repeat usage are unknown. The seven interview contacts
+  are my only distribution channel; no invented acquisition metrics.
+
+Use the available Agent tool for the independent opinion and spec review when
+the workflow calls for them. The independent opinion is read-only. The spec
+reviewer may use Write only for the exact JSON verdict path assigned by prepare;
+all other reviewer mutations remain prohibited. An automated test is not a reason
+to skip them. This fixture checks separate real tool calls: obtain the independent
+opinion on RosterCheck before writing the design, then have a reviewer read the
+written design. A self-authored "second opinion" is not a subagent result.
+Keep the normal revision/convergence rules and report any unresolved concerns
+honestly. Save the design to docs/designs/roster-check.md in this fixture;
+keep all artifacts inside the fixture. After the review, choose the recommended
+design approval and mark the design APPROVED before the relationship closing.
+Include the assignment and concise "Spec Review" and "Handoff" sections in the
+final REPORT.md with the review disposition and next-skill recommendation.
+In "Spec Review", write one terminal field, "Disposition: COMPLETED",
+"Disposition: CONCERNS_RECORDED", or "Disposition: UNREVIEWED", followed by what
+happened (including unresolved concerns or a failed review attempt, if any).
+The user has already answered the final handoff choice: "Not now — I'll run a
+review later." Complete the office-hours closing, then stop;
+do not launch the downstream skill or open a browser.`,
     staticInvariants: {
       mustStayInSkeleton: [],
       mustMoveToSection: ['### The Six Forcing Questions', '### Pushback Patterns', 'Anti-Sycophancy Rules', 'Wild exemplar'],
       mustPrecedeStop: ['**Mode mapping:**'],
       gateAfterStop: '## Section self-check',
     },
-    behavioral: 'prompt',
+    behavioral: 'external',
+    externalTest: 'test/skill-e2e-office-hours-section-loading.test.ts',
     // v1.2.0 activation lift: first-run-guidance section in the shared preamble,
     // plus the P1 office-hours closing handoff (AUQ that launches the next skill).
     // v1.65 merge: provisional larger-of-both-waves budget; re-measured below.
@@ -295,15 +348,15 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
     // the #538 opt-out + D1 evidence directive — ratio 1.104 measured.
     // #2499 project-scope MCP jq in the brain-sync block grew every tier-2+
     // skeleton ~1.5KB (entry resolution emitted once per SKILL.md).
-    maxSkeletonBytes: 76_800, // + v2.0 {{ASIDE_RESEARCH}} (Aside first, WebSearch fallback); measured 75_804
+    maxSkeletonBytes: 89_700, // Office-hours + sketch outside voices include host guards and completion checks. + v1.91.19.0 wave: Q<N> open-question prose form (#2729, approved Q3), DESIGN_READY --version probe (B4), Aside ~/.local/bin fallback (E7), verdict-form outside voice (INV-1), plus v1.91.17.0's round accounting (#3022) merged in; measured 89,684 (2026-10-03).
     minUnionBytes: 115_800, // Phase 4 wave 4; measured union 118,175
     mustContain: ['design doc', 'problem statement'],
     maxSizeRatio: 1.12,
   },
   'document-release': {
     skill: 'document-release',
-    expectedSections: ['release-body.md'],
-    requiredReads: ['release-body.md'],
+    expectedSections: ['audit-scope.md', 'release-body.md'],
+    requiredReads: ['audit-scope.md', 'release-body.md'],
     scenario:
       'A PR has shipped a new CLI flag and touched README.md and CHANGELOG.md. Skip the git pre-flight shell commands (assume the diff adds --new-flag and updates those two docs). Run the documentation workflow: build the coverage map, then audit the docs, apply updates, and polish the CHANGELOG voice. Produce the documentation health summary.',
     staticInvariants: {
@@ -334,7 +387,7 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
     expectedSections: ['proposal-and-preview.md'],
     requiredReads: ['proposal-and-preview.md'],
     scenario:
-      'The user gave product context (a B2B analytics dashboard for ops teams) and declined the research phase. Skip browser/design tool setup. Proceed to build the complete design-system proposal, then write DESIGN.md. Produce the proposal and the DESIGN.md content.',
+      'The user gave product context (a B2B analytics dashboard for ops teams), declined the research phase and declined the optional outside design voices. Skip browser/design tool setup. Proceed to build the complete design-system proposal, then write DESIGN.md and its CLAUDE.md guidance.',
     staticInvariants: {
       mustStayInSkeleton: ['## Phase 0: Pre-checks', '## Phase 1: Product Context', '## Phase 2: Research'],
       mustMoveToSection: ['## Phase 3: The Complete Proposal', '## Phase 6: Write DESIGN.md'],
@@ -347,14 +400,18 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
     // v1.65 merge: provisional larger-of-both-waves budget; re-measured below.
     // v1.64.1.0: shared-preamble prose from the two parallel v1.64 waves lands
     // the skeleton at 69,022 B; +~1 KB headroom.
-    maxSkeletonBytes: 67_500, // + v1.82 open DESIGN.md format check ({{DESIGN_MD_CHECK}} in Phase 0); measured 67_014
+    maxSkeletonBytes: 72_500, // Outside review + upstream DESIGN.md format check; merged render 72,175 bytes.
     minUnionBytes: 65_000, // token-reduction Phases 1-2 (v1.69.x branch): preamble bash -> bin/gstack-skill-start, onboarding -> gated emission; measured union 72,252
     mustContain: ['Typography', 'Color', 'Aesthetic Direction'],
     // Cross-cutting preamble growth (v1.57.2.0 AUQ-failure prose fallback ~2KB +
     // the cross-session decision-memory nudge) lands this carved skeleton just over
     // the strict 1.05; headroom for the shared preamble additions.
     // v1.64+v1.65 merge sums both waves' preamble growth; measured 1.073.
-    maxSizeRatio: 1.08,
+    // + W1 guarded state-root resolution in the Context Recovery preamble, the
+    // eureka log, the office-hours lookup and the taste-profile read; measured
+    // 1.0834 (2026-09-30). + named design-direction defaults to avoid in the native
+    // subagent prompt (s02 H4a); measured 1.0911 (2026-10-02).
+    maxSizeRatio: 1.112, // + v1.91.19.0 wave: design --version probe (B4), taste-profile load (F3), verdict-form outside voice (INV-1), plus v1.91.17.0's round accounting and board/approval blocks (#3022) merged in; measured 100,446 / 90,375 = 1.1114 (2026-10-03).
   },
   cso: {
     skill: 'cso',
@@ -363,7 +420,7 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
     scenario:
       'Run a security audit on this repository in --owasp mode (OWASP Top 10 only). Resolve the mode, do the Phase 0 stack detection and Phase 1 attack-surface census, then run the scoped audit phases and produce the findings report. Skip any step that needs network access.',
     staticInvariants: {
-      // Dispatch + always-run + FP-filtering phases are ALWAYS loaded (security).
+      // Dispatch, trusted execution, evidence/proof, reporting and recovery stay always loaded.
       mustStayInSkeleton: [
         '## Arguments',
         '## Mode Resolution',
@@ -372,6 +429,9 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
         '### Phase 12',
         '### Phase 13',
         '### Phase 14',
+        '**Private startup.**',
+        'CSO evidence rubric',
+        'identical security assertion',
       ],
       // Earliest-use: mode must be resolvable before any section is read (codex #6).
       mustPrecedeStop: ['## Arguments', '## Mode Resolution'],
@@ -383,23 +443,21 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
       ],
       gateAfterStop: undefined,
     },
-    behavioral: 'prompt',
-    // +Conductor AUQ-default-prose rule + one-way/continuation safety in the
-    // always-loaded AskUserQuestion Format section.
-    // v1.2.0 activation lift: first-run-guidance section in the shared preamble.
-    maxSkeletonBytes: 61_800, // + v2.0 {{ASIDE_RESEARCH}} (Aside first, WebSearch fallback); measured 60_628
-    minUnionBytes: 64_200, // token-reduction Phases 1-2 (v1.69.x branch); measured union 71,379
+    // v3 requires a trusted helper and private state, absent from generic prompt fixtures.
+    // The full-audit E2E asserts actual section loading alongside report/proof behavior.
+    behavioral: 'external',
+    externalTest: 'test/skill-e2e-cso.test.ts',
+    maxSkeletonBytes: 18_000,
+    minUnionBytes: 30_000, // v3 deliberately removes the shared export/startup preamble.
     mustContain: ['OWASP', 'STRIDE', 'daily', 'comprehensive', 'verif'],
-    // cso keeps its mode-dispatch + FP-filtering phases always-loaded, so the
-    // cross-cutting preamble growth (v1.57.2.0 AUQ-failure prose fallback ~2KB + the
-    // decision-memory nudge) lands it just over 1.05; headroom for the shared additions.
-    // v1.64+v1.65 merge sums both waves' preamble growth; measured 1.073.
+    // Existing baseline comparison remains an upper bound; absolute limits above
+    // preserve the compact controller and its complete domain reference.
     maxSizeRatio: 1.08,
   },
   // ── Token-reduction Phase 4 wave 1 (v1.69.x branch) ──────────────────────
   review: {
     skill: 'review',
-    expectedSections: ['plan-completion.md', 'review-army.md', 'adversarial.md'],
+    expectedSections: ['plan-completion.md', 'review-army.md', 'shared-code-reuse.md', 'adversarial.md'],
     requiredReads: ['plan-completion.md', 'review-army.md'],
     scenario:
       "The working tree has a real diff against the base branch (assume Step 1's git checks passed; the diff implements the PLAN.md cache layer). Run the /review flow: the scope-drift and plan-completion deep pass against PLAN.md, then the critical pass, then the Review Army specialist dispatch — apply the specialist checklists yourself instead of launching subagents. Produce the review report. Do NOT commit, push, or create a PR.",
@@ -424,9 +482,10 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
       gateAfterStop: undefined, // operational multi-STOP skill, like ship
     },
     behavioral: 'plan',
-    maxSkeletonBytes: 61_500, // + v2.0 {{ASIDE_RESEARCH}} (Aside first, WebSearch fallback); measured 60_309
+    maxSkeletonBytes: 74_881, // Shared-code identity/skip/action rules + critical-severity validation; measured 74,493 (2026-09-17). + v1.91.12.0 merge of #2999 (review clarity repairs: await reads, research alongside dispatch, /review deadline and setup authority, findings sources) with #3002 (guarded state-root lines, plan-check checkpoints); each fit alone; measured 74,881 (2026-10-01).
     minUnionBytes: 89_000, // Phase 4 wave 1; measured union 93,357
     mustContain: ['confidence', 'P1', 'P2', 'Review Army', 'adversarial'],
+    maxSizeRatio: 1.199, // Shared-code feature + critical-severity validation: 128,042 union bytes / 108,523 baseline = 1.1799; preserves content floors. + v1.91.12.0 merge of #2999 (above, plus plan-completion fallback intent and specialist checklist-by-path) with #3002; measured 1.1843 (2026-10-01). + v1.91.19.0 wave: verdict-form Codex callers with sandbox preflight (INV-1/B1), P0/P1 structured gate (B1b), bound-plan discovery and data-not-instructions guard (F1/D3), visible LEARNINGS failures (B5); measured 129,941 / 108,523 = 1.1974 (2026-10-03). + v1.91.18.0 (#3023) merged into the v1.91.19.0 wave; measured 130,025 / 108,523 = 1.1981 (2026-10-04).
   },
   codex: {
     skill: 'codex',
@@ -440,7 +499,7 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
         '## Filesystem Boundary',
         'Synthesis recommendation (REQUIRED)',
         'Recommendation: <action> because',
-        'UNDER_CODEX',
+        'If the runtime guard reports a harness mismatch, stop.',
       ],
       mustPrecedeStop: ['## Step 1: Detect mode', '## Filesystem Boundary'],
       mustMoveToSection: [
@@ -451,7 +510,7 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
       gateAfterStop: 'EXIT PLAN MODE GATE',
     },
     behavioral: 'prompt',
-    maxSkeletonBytes: 59_300, // + v1.78 AUQ spawned-trigger objectivity (explicit declaration + interactive fence); measured 58_867
+    maxSkeletonBytes: 59_350, // + v1.78 AUQ spawned-trigger objectivity; generated Codex overlay measured 59,307
     minUnionBytes: 83_400, // Phase 4 wave 1; measured union 84,304
     mustContain: ['GATE: PASS', 'CROSS-MODEL ANALYSIS', 'codex exec resume', 'sandbox_mode="read-only"', 'mktemp'],
     maxSizeRatio: 1.06, // measured 1.040 vs the v1.64.1.0 parity baseline
@@ -478,15 +537,15 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
     },
     behavioral: 'prompt',
     maxSkeletonBytes: 74_500, // + Aside browser contract for Step 7 canary ({{ASIDE_SETUP}}); measured 73_523
-    maxSizeRatio: 1.10, // + v1.81 Aside contract + gstack-browser fallback block; measured 1.077
+    maxSizeRatio: 1.100, // + v1.81 Aside contract + gstack-browser fallback block; measured 1.077. + both untrusted-content marker formats in the browser fallback (W7f) + the readiness gate's project test command and live eval-store paths (s06 H6/H7); measured 1.1076 (2026-10-02). Re-measured 1.0943 (2026-10-03); cap = measured + 0.005 headroom.
     minUnionBytes: 91_000, // Phase 4 wave 1; estimated union ~94.9KB
     mustContain: ['readiness', 'merge', 'canary', 'revert', 'staging'],
   },
   // ── Token-reduction Phase 4 wave 2 (v1.69.x branch) ──────────────────────
   autoplan: {
     skill: 'autoplan',
-    expectedSections: ['ceo-phase.md', 'design-phase.md', 'eng-phase.md', 'dx-phase.md', 'tasks-aggregator.md'],
-    requiredReads: ['ceo-phase.md', 'eng-phase.md', 'tasks-aggregator.md'],
+    expectedSections: ['ceo-phase.md', 'design-phase.md', 'eng-phase.md', 'dx-phase.md', 'phase-close.md', 'tasks-aggregator.md'],
+    requiredReads: ['ceo-phase.md', 'eng-phase.md', 'phase-close.md', 'tasks-aggregator.md'],
     scenario:
       'Run the /autoplan pipeline against the plan in PLAN.md. Codex and subagent tools are unavailable — note both voices unavailable (single-reviewer mode) and keep going. The plan has no UI scope and no developer-facing scope, so Phase 2 and Phase 2.5 are skipped (do not read their sections). Execute Phase 1 (CEO) and Phase 3 (Eng) at full depth, run the Phase 4 aggregator step, and produce the Final Approval Gate summary as the report.',
     staticInvariants: {
@@ -495,7 +554,7 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
         '## Sequential Execution — MANDATORY',
         '## Decision Classification',
         '## Filesystem Boundary — Codex Prompts',
-        '## Phase 0.5: Codex auth + version preflight',
+        '## Phase 0.5: Outside reviewer preflight',
         '## Pre-Gate Verification',
         '## Phase 2: Design Review (conditional — skip if no UI scope)',
         '## Phase 2.5: DX Review (conditional — skip if no developer-facing scope)',
@@ -504,18 +563,19 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
       mustPrecedeStop: ['## The 6 Decision Principles', '## Sequential Execution — MANDATORY', '## Decision Classification'],
       mustMoveToSection: [
         'CEO DUAL VOICES — CONSENSUS TABLE:',
-        'CODEX SAYS (design — UX challenge)',
+        'Codex SAYS (design — UX challenge)',
         'ENG DUAL VOICES — CONSENSUS TABLE:',
         'DX DUAL VOICES — CONSENSUS TABLE:',
         '## Implementation Tasks aggregator',
       ],
       gateAfterStop: 'AskUserQuestion options:',
     },
-    behavioral: 'external',
-    externalTest: 'test/skill-e2e-autoplan-chain.test.ts', // phase-complete markers live ONLY in sections — its assertions ARE section-read proof
-    maxSkeletonBytes: 65_100, // + v1.78 AUQ objectivity + #2745 broken-install preflight arm + outside-voice honest labeling; measured 64_668
+    // The retired skill-e2e-autoplan-chain was its only section-read proof.
+    behavioral: 'none',
+    maxSkeletonBytes: 70_000, // Phase-specific outside coverage, native fallback, and harness guard.
     minUnionBytes: 85_000, // measured union 86,926
     mustContain: ['6 Decision Principles', 'TASTE DECISION', 'USER CHALLENGE', 'consensus', 'Restore Point'],
+    maxSizeRatio: 1.12, // Four validated outside invocations replace raw CLI calls; phases keep independent coverage.
   },
   spec: {
     skill: 'spec',
@@ -579,19 +639,18 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
   // ── Token-reduction Phase 4 wave 3 (v1.69.x branch) ──────────────────────
   qa: {
     skill: 'qa',
-    expectedSections: ['test-bootstrap.md', 'qa-patterns.md'],
-    requiredReads: ['qa-patterns.md'],
+    expectedSections: ['scope.md', 'browser-setup.md', 'exploratory.md', 'system-functional.md', 'browser-verify.md', 'test-bootstrap.md', 'qa-patterns.md'],
+    requiredReads: ['scope.md', 'browser-setup.md', 'exploratory.md', 'qa-patterns.md'],
     scenario:
       'Walk /qa in SIMULATION — do not launch a browser, run any aside command, or execute bash; treat the working tree as clean, the tier as Quick, and the target app as http://localhost:3000 with a small feature-branch diff touching one page. Skip the test-framework bootstrap (assume CLAUDE.md documents the test command). Read each pointed section before doing its step, then produce the QA plan as the report: the mode you selected and why, the Phase 1-6 steps you would run, and a worked health-score computation from the rubric. Do NOT use AskUserQuestion.',
     staticInvariants: {
       mustStayInSkeleton: [
         '## Setup',
-        '## BROWSER SETUP (Aside',
         '## Phases 1-6: QA Baseline',
         '## Phase 7: Triage',
         '## Phase 8: Fix Loop',
         '8e.5. Regression Test',
-        'WTF-LIKELIHOOD',
+        '### 8f. Self-Regulation',
         '## Additional Rules (qa-specific)',
         '## Output Structure',
       ],
@@ -599,6 +658,8 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
       mustMoveToSection: [
         '## Test Framework Bootstrap',
         'BOOTSTRAP_DECLINED',
+        '### Select the surface before setup',
+        '## BROWSER SETUP (Aside',
         '## Health Score Rubric',
         '### Diff-aware (automatic when on a feature branch with no URL)',
         'Never refuse to use the browser',
@@ -607,10 +668,27 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
     },
     behavioral: 'prompt',
     maxSkeletonBytes: 63_500, // + v2.0 {{ASIDE_SETUP}}/{{BROWSE_FALLBACK}} (replaces the browse setup block); measured 61_253
-    maxSizeRatio: 1.08, // + v1.81 Aside contract + gstack-browser fallback block; measured 1.063
+    maxSizeRatio: 1.1102, // + v1.81 Aside contract + gstack-browser fallback block (1.080 on v1.91.7.0) + the shared test value bar at 8a.5 ({{TEST_VALUE_BAR:qa}}); measured 1.094 + W1 guarded state-root resolution (`eval gstack-paths; : "${GSTACK_STATE_ROOT:?…}"`) in the Context Recovery preamble, the eureka log and each state-writing bash block; measured 1.101 (2026-09-30) + v1.91.12.0 merge of #2999 (await scope/method Reads, capture --after checkpoints, browser-only empty evidence list) with #3002; measured 1.1028 (2026-10-01). + both untrusted-content marker formats in the browser fallback (W7f); measured 1.1035 (2026-10-02). Re-measured 1.1038 after the W8 probe-loop renames (2026-10-03); the cap already matches. + the annotate-every-capture and superseded rule before materialize (a ship-exploratory-late-input run published evidence that omitted older-snapshot captures); measured 1.1064 (2026-10-03). + v1.91.18.0 (#3023) merged into the v1.91.19.0 wave; measured 93,282 / 84,049 = 1.1099 (2026-10-04). + reliability follow-ups C2 from GSTA-21's branch (feasible 180 s Browser Quick, the /qa outcome filename fields and measured timing fields the qa-only judge named; 10/10 judge passes vs 7/10 before), with its trims; measured 93,303 / 84,049 = 1.11010 (2026-10-05).
     minUnionBytes: 69_500, // measured union 70,385
     // 'aside repl' pins the Aside contract; '$B goto' pins the fallback block in the always-loaded skeleton.
     mustContain: ['bug', 'aside repl', '$B goto', 'fix', 'Health Score Rubric', 'regression'],
+  },
+  'qa-only': {
+    skill: 'qa-only',
+    expectedSections: ['exploratory.md'],
+    requiredReads: ['exploratory.md'],
+    scenario:
+      'Walk /qa-only for an isolated CLI fixture using its declared native commands. Read installed scope, exploratory and functional resources; never read browser setup or DX instructions. Report contract outcomes and proposed tests without changing product, tests or Git. Do not use AskUserQuestion.',
+    staticInvariants: {
+      mustStayInSkeleton: ['## Request Parameters', 'Never fix bugs or write product tests', '## Output'],
+      mustPrecedeStop: ['## Request Parameters'],
+      mustMoveToSection: ['# Shared exploratory QA'],
+    },
+    behavioral: 'external',
+    externalTest: 'test/skill-e2e-qa-functional.test.ts',
+    maxSkeletonBytes: 45_000,
+    minUnionBytes: 40_000,
+    mustContain: ['contract', 'Never fix bugs', 'edit-then-restore', 'test_stub'],
   },
   browse: {
     skill: 'browse',
@@ -705,7 +783,7 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
       gateAfterStop: undefined,
     },
     behavioral: 'prompt',
-    maxSkeletonBytes: 54_000, // + v2.0 preamble growth (merged); measured 52_962
+    maxSkeletonBytes: 55_200, // + v2.0 preamble growth (merged); measured 52_962 + v1.91.19.0 wave: design --version probe (B4) and taste profile (F3) on top of v1.91.17.0's claim-based staging and round accounting (#3022); measured 55,168 (2026-10-03).
     minUnionBytes: 53_200, // Phase 4 wave 4; measured union 54,290
     mustContain: ["Don't make me think", "Users scan, they don't read", 'trunk test', '44px minimum'],
   },

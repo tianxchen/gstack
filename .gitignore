@@ -8,6 +8,19 @@ make-pdf/dist/
 !lib/diagram-render/dist/
 !lib/diagram-render/dist/**
 bin/gstack-global-discover*
+# Compiled CSO launcher, helper, and watchdog.
+bin/gstack-cso-launcher
+bin/gstack-cso-launcher.exe
+bin/gstack-cso-core
+bin/gstack-cso-core.exe
+bin/gstack-cso-watchdog
+bin/gstack-cso-watchdog.exe
+bin/.gstack-cso-stage.*
+bin/.gstack-cso-build.lock/
+bin/.gstack-cso-generation.lock
+bin/.gstack-cso-generation
+lib/cso/images/gstack-cso-verifier
+lib/cso/images/gstack-cso-preparation
 .gstack/
 .claude/skills/
 .claude/gstack-rendered/
@@ -19,6 +32,7 @@ bin/gstack-global-discover*
 .opencode/
 .slate/
 .cursor/
+.copilot/
 .openclaw/
 .hermes/
 .gbrain/
@@ -46,6 +60,6 @@ docs/throughput-*.json
 .sources/
 
 # SPM build output from the gen-accessors tool (built in place by
-# skill-e2e-ios-swift-build; regenerates on every run — never commit)
+# test/ios-qa-swift-build.test.ts; regenerates on every run — never commit)
 ios-qa/scripts/gen-accessors-tool/.build/
 ios-qa/scripts/gen-accessors-tool/Package.resolved

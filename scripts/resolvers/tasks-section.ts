@@ -18,13 +18,19 @@ export const generateTasksSectionEmit: ResolverFn = (_ctx: TemplateContext, args
   if (!phase || !VALID_PHASES.has(phase)) {
     throw new Error(`TASKS_SECTION_EMIT requires one of ${[...VALID_PHASES].join(', ')} — got ${phase}`);
   }
+  const ceo = _ctx.skillName === 'plan-ceo-review';
+  const conditionalWrites = ceo || _ctx.skillName === 'plan-eng-review';
+  const storagePolicy = ceo ? 'Step 0 storage policy' : 'Review record and write policy';
 
   return `## Implementation Tasks
 
-Before closing this review, synthesize the findings above into a flat list of
-build-actionable tasks. Each task derives from a specific finding — no padding.
-Emit the markdown section AND write a JSONL artifact that \`/autoplan\` can
-aggregate across phases.
+${ceo ? `Turn findings into tasks within the approved review depth. Implementation-ready
+tasks describe the build. Strategy-only tasks name the next research, design or
+verification action and its owner; they do not choose implementation contracts.
+List known files only. For unknown files, write "to be determined" and use an
+empty JSONL files array. Each task needs a concrete verification step.` : `Before closing this review, synthesize the findings above into a flat list of
+build-actionable tasks. Each task derives from a specific finding — no padding.`}
+${conditionalWrites ? `Always emit the markdown section. Write its JSONL artifact for \`/autoplan\` only when the ${storagePolicy} permits it; otherwise label the complete task output not persisted and do not claim an aggregation artifact exists.` : 'Emit the markdown section AND write a JSONL artifact that `/autoplan` can\naggregate across phases.'}
 
 ### Markdown section (always emit)
 
@@ -44,17 +50,19 @@ Rules:
 - P1 blocks ship; P2 should land same branch; P3 is a follow-up TODO.
 - If a finding produced no actionable task, do not invent one.
 - If a section had zero findings, emit \`_No new tasks from <section>._\`
-- Effort uses the AI-compression table from CLAUDE.md.
+- Show human-team and CC+gstack effort estimates. Default task-type ratios (human ÷ CC time): scaffolding ~100x, tests ~50x, features ~30x, bug fix with regression ~20x, architecture ~5x, research ~3x. Adjust to the actual work and state the assumption.
 
-### JSONL artifact (always write, even if zero tasks)
+### JSONL artifact (${conditionalWrites ? 'write when permitted, including zero tasks' : 'always write, even if zero tasks'})
 
 \`/autoplan\` reads this file to aggregate across phases. Build each line with
 \`jq -nc\` so titles and source findings containing quotes, newlines, or
 backslashes serialize cleanly — never use hand-rolled \`echo\` / \`printf\`.
 
 \`\`\`bash
-eval "$(~/.claude/skills/gstack/bin/gstack-slug 2>/dev/null)"
-TASKS_DIR="\${HOME}/.gstack/projects/\${SLUG:-unknown}"
+GSTACK_STATE_ROOT=$(~/.claude/skills/gstack/bin/gstack-paths --get GSTACK_STATE_ROOT); : "\${GSTACK_STATE_ROOT:?gstack-paths failed; reinstall with ./setup or /gstack-upgrade}"
+BRANCH=$(~/.claude/skills/gstack/bin/gstack-slug --get BRANCH 2>/dev/null)
+SLUG=$(~/.claude/skills/gstack/bin/gstack-slug --get SLUG 2>/dev/null)
+TASKS_DIR="$GSTACK_STATE_ROOT/projects/\${SLUG:-unknown}"
 mkdir -p "$TASKS_DIR"
 TASKS_FILE="$TASKS_DIR/tasks-${phase}-$(date +%Y%m%d-%H%M%S).jsonl"
 COMMIT=$(git rev-parse HEAD 2>/dev/null || echo unknown)
@@ -86,7 +94,7 @@ jq -nc \\
 If \`jq\` is not installed, fall back to skipping the JSONL write and warn
 the user to install jq for autoplan aggregation. Never hand-roll JSONL.
 
-If zero tasks were identified in this review, still touch the JSONL file
+${conditionalWrites ? 'When writes are permitted and zero tasks were identified, touch the JSONL file' : 'If zero tasks were identified in this review, still touch the JSONL file'}
 (\`: > "$TASKS_FILE"\`) so the aggregator sees that the phase produced output
 this run (an empty file means "ran, no findings" — distinct from "didn't run").
 `;
@@ -99,8 +107,10 @@ Before rendering the Final Approval Gate output block below, aggregate the
 per-phase task lists each review skill wrote.
 
 \`\`\`bash
-eval "$(~/.claude/skills/gstack/bin/gstack-slug 2>/dev/null)"
-TASKS_DIR="\${HOME}/.gstack/projects/\${SLUG:-unknown}"
+GSTACK_STATE_ROOT=$(~/.claude/skills/gstack/bin/gstack-paths --get GSTACK_STATE_ROOT); : "\${GSTACK_STATE_ROOT:?gstack-paths failed; reinstall with ./setup or /gstack-upgrade}"
+BRANCH=$(~/.claude/skills/gstack/bin/gstack-slug --get BRANCH 2>/dev/null)
+SLUG=$(~/.claude/skills/gstack/bin/gstack-slug --get SLUG 2>/dev/null)
+TASKS_DIR="$GSTACK_STATE_ROOT/projects/\${SLUG:-unknown}"
 BRANCH=$(git branch --show-current 2>/dev/null || echo unknown)
 # Commit window: last 5 commits on this branch. Drops stale standalone reviews.
 COMMITS_RECENT=$(git log --format=%H -n 5 2>/dev/null | tr '\\n' '|' | sed 's/|$//')
@@ -123,7 +133,7 @@ if command -v jq >/dev/null 2>&1; then
       # .commit must be bound BEFORE piping to the split commit array: a
       # pipe rebinds jq's context, so a bare .commit after it indexes the
       # ARRAY with a string, every line errors into 2>/dev/null, and the
-      # aggregate is empty forever — the #2018 zero-tasks bug.
+      # aggregate is empty forever.
       jq -c --arg branch "$BRANCH" --arg commits "$COMMITS_RECENT" \\
         '.commit as $c | select(.branch == $branch and ($commits | split("|") | index($c) != null))' \\
         "$f" 2>/dev/null >> "$ALL_JSONL" || true

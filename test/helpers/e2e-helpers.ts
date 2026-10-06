@@ -6,7 +6,7 @@
  */
 
 import '../../lib/conductor-env-shim';
-import { describe, test, beforeAll, afterAll, expect } from 'bun:test';
+import { describe, test, afterAll, expect } from 'bun:test';
 import type { SkillTestResult } from './session-runner';
 import { EvalCollector, judgePassed } from './eval-store';
 import type { EvalTestEntry } from './eval-store';
@@ -14,8 +14,8 @@ import { judgeRecommendation, type RecommendationScore } from './llm-judge';
 import { selectTests, detectBaseBranch, getChangedFiles, E2E_TOUCHFILES, E2E_TIERS, GLOBAL_TOUCHFILES } from './touchfiles';
 import { WorktreeManager } from '../../lib/worktree';
 import type { HarvestResult } from '../../lib/worktree';
-import { spawnSync } from 'child_process';
 import { preflightAnthropicApi } from './anthropic-preflight';
+import { isHermeticEnabled } from './hermetic-env';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -94,15 +94,18 @@ export function resolveModuleSelection(
   compute: () => string[] | null,
   stderrWrite: (text: string) => void = (text) => process.stderr.write(text),
 ): string[] | null {
+  const strictProfile = process.env.EVALS_PROFILE === 'pr';
   if (raw) {
     try {
       const { selected, reason } = parseEvalsSelectionJson(raw);
       stderrWrite(`\nE2E selection (parent-propagated: ${reason}): ${selected === null ? 'all' : selected.length} tests\n`);
       return selected;
     } catch (err) {
+      if (strictProfile) throw new Error(`PR profile requires a valid persisted selection: ${err instanceof Error ? err.message : String(err)}`);
       stderrWrite(`WARNING: malformed EVALS_SELECTION_JSON (${err instanceof Error ? err.message : String(err)}) — falling back to local selection\n`);
     }
   }
+  if (strictProfile) throw new Error('PR profile requires persisted case selection from scripts/test-paid-shards.ts');
   return compute();
 }
 
@@ -114,9 +117,10 @@ export let selectedTests: string[] | null = resolveModuleSelection(
 // EVALS_TIER: filter tests by tier after diff-based selection.
 // 'gate' = gate tests only (CI default — blocks merge)
 // 'periodic' = periodic tests only (weekly cron / manual)
+// 'marathon' = full end-to-end flows only (non-blocking marathon lane)
 // not set = run all selected tests (local dev default, backward compat)
 if (evalsEnabled && process.env.EVALS_TIER) {
-  const tier = process.env.EVALS_TIER as 'gate' | 'periodic';
+  const tier = process.env.EVALS_TIER as 'gate' | 'periodic' | 'marathon';
   const tierTests = Object.entries(E2E_TIERS)
     .filter(([, t]) => t === tier)
     .map(([name]) => name);
@@ -226,6 +230,18 @@ export function createEvalCollector(suite: string): EvalCollector | null {
 }
 
 /** DRY helper to record an E2E test result into the eval collector. */
+/** Exit reasons for an API or transport failure (session-runner.ts). */
+const INFRA_EXIT_REASONS = new Set(['error_api', 'timeout_startup', 'error_output_stream']);
+
+/** API/transport error or CLI crash before the first model turn: INFRA, never a
+ *  verdict on the product. Any assistant event or counted turn means the model
+ *  ran, so its refusal, timeout or wrong answer stays an ordinary failure. */
+export function isPreTurnInfraFailure(result: Pick<SkillTestResult, 'exitReason' | 'transcript' | 'costEstimate'>): boolean {
+  return result.costEstimate.turnsUsed === 0
+    && (INFRA_EXIT_REASONS.has(result.exitReason) || /^exit_code_\d+$/.test(result.exitReason))
+    && !result.transcript.some(event => event?.type === 'assistant');
+}
+
 export function recordE2E(
   evalCollector: EvalCollector | null,
   name: string,
@@ -238,9 +254,11 @@ export function recordE2E(
     ? `${result.toolCalls[result.toolCalls.length - 1].tool}(${JSON.stringify(result.toolCalls[result.toolCalls.length - 1].input).slice(0, 60)})`
     : undefined;
 
+  const passed = extra?.passed ?? (result.exitReason === 'success' && result.browseErrors.length === 0);
   evalCollector?.addTest({
     name, suite, tier: 'e2e',
-    passed: result.exitReason === 'success' && result.browseErrors.length === 0,
+    passed,
+    ...(!passed && isPreTurnInfraFailure(result) ? { failure_class: 'infra' as const } : {}),
     duration_ms: result.duration,
     cost_usd: result.costEstimate.estimatedCost,
     transcript: result.transcript,
@@ -281,10 +299,14 @@ export async function assertRecommendationQuality(opts: {
   evalTitle: string;
   result: SkillTestResult;
   passed: boolean;
+  signal?: AbortSignal;
+  /** Let a bounded attempt defer its one terminal record until all assertions settle. */
+  record?: (extra: Pick<EvalTestEntry, 'judge_scores' | 'judge_reasoning'>) => void;
 }): Promise<RecommendationScore> {
-  const recScore = await judgeRecommendation(opts.captured);
-  recordE2E(opts.evalCollector, opts.evalId, opts.evalTitle, opts.result, {
-    passed: opts.passed,
+  opts.signal?.throwIfAborted();
+  const recScore = await judgeRecommendation(opts.captured, opts.signal);
+  opts.signal?.throwIfAborted();
+  const metadata = {
     judge_scores: {
       rec_present: recScore.present ? 1 : 0,
       rec_commits: recScore.commits ? 1 : 0,
@@ -292,7 +314,9 @@ export async function assertRecommendationQuality(opts: {
       rec_substance: recScore.reason_substance,
     },
     judge_reasoning: `${recScore.reasoning} | reason: "${recScore.reason_text}"`,
-  });
+  };
+  if (opts.record) opts.record(metadata);
+  else recordE2E(opts.evalCollector, opts.evalId, opts.evalTitle, opts.result, { passed: opts.passed, ...metadata });
   expect(recScore.present, recScore.reasoning).toBe(true);
   expect(recScore.commits, recScore.reasoning).toBe(true);
   expect(recScore.has_because, recScore.reasoning).toBe(true);
@@ -319,7 +343,7 @@ export async function finalizeEvalCollector(evalCollector: EvalCollector | null)
 // NOTE: since gstack-skill-start honors GSTACK_HOME (EOV7), hermetic children read the
 // temp GSTACK_HOME that hermetic-env.ts seeds (the canonical marker list lives there);
 // this operator-HOME seeding only serves EVALS_HERMETIC=0 debug runs.
-if (evalsEnabled) {
+if (evalsEnabled && !isHermeticEnabled()) {
   const gstackDir = path.join(os.homedir(), '.gstack');
   fs.mkdirSync(gstackDir, { recursive: true });
   // Marker list kept at parity with hermetic-env.ts's child-GSTACK_HOME seed
@@ -330,7 +354,6 @@ if (evalsEnabled) {
     '.telemetry-prompted',
     '.proactive-prompted',
     '.first-loop-tip-shown',
-    '.feature-prompted-continuous-checkpoint',
     '.feature-prompted-model-overlay',
   ]) {
     const p = path.join(gstackDir, f);
@@ -390,24 +413,6 @@ export function harvestAndCleanup(testName: string): HarvestResult | null {
   }
   mgr.cleanup(testName);
   return result;
-}
-
-/**
- * Convenience: describe block with automatic worktree isolation + harvest.
- * Any test file can use this to get real repo context instead of a tmpdir.
- * Note: tests with planted-bug fixtures should NOT use this — they need their fixture repos.
- */
-export function describeWithWorktree(
-  name: string,
-  testNames: string[],
-  fn: (getWorktreePath: () => string) => void,
-) {
-  describeIfSelected(name, testNames, () => {
-    let worktreePath: string;
-    beforeAll(() => { worktreePath = createTestWorktree(name); });
-    afterAll(() => { harvestAndCleanup(name); });
-    fn(() => worktreePath);
-  });
 }
 
 export { judgePassed } from './eval-store';

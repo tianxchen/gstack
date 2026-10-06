@@ -17,17 +17,20 @@ import { describe, test, expect } from 'bun:test';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { getHermeticDirs, hermeticSkillsConfigDir } from './helpers/hermetic-env';
+import { buildHermeticEnv, getHermeticDirs, hermeticSkillsConfigDir } from './helpers/hermetic-env';
 
 const ROOT = path.resolve(import.meta.path, '..', '..');
 
+// The PTY harness launches from test/helpers/pty/launch.ts (claude-pty-runner.ts is its barrel).
 const RUNNERS = [
   'test/helpers/session-runner.ts',
-  'test/helpers/claude-pty-runner.ts',
+  'test/helpers/pty/launch.ts',
   'test/helpers/codex-session-runner.ts',
-  'test/helpers/gemini-session-runner.ts',
   'test/helpers/agent-sdk-runner.ts',
 ];
+const HERMETIC_IMPORT: Record<string, string> = { 'test/helpers/pty/launch.ts': "from '../hermetic-env'" };
+const PTY_MODULES = fs.readdirSync(path.join(ROOT, 'test/helpers/pty'), { recursive: true })
+  .map(String).filter(file => file.endsWith('.ts')).map(file => `test/helpers/pty/${file}`);
 
 function read(rel: string): string {
   return fs.readFileSync(path.join(ROOT, rel), 'utf-8');
@@ -38,7 +41,7 @@ describe('hermetic wiring tripwire', () => {
     for (const rel of RUNNERS) {
       const src = read(rel);
       expect(src.includes('hermeticChildEnv(') ).toBe(true);
-      expect(src.includes("from './hermetic-env'")).toBe(true);
+      expect(src.includes(HERMETIC_IMPORT[rel] ?? "from './hermetic-env'")).toBe(true);
     }
   });
 
@@ -46,7 +49,7 @@ describe('hermetic wiring tripwire', () => {
     // `...process.env` inside an env object is the exact pre-hermetic leak.
     // hermetic-env.ts itself legitimately READS process.env (call-time
     // snapshot); the runners must not SPREAD it into a child env.
-    for (const rel of RUNNERS) {
+    for (const rel of [...RUNNERS, ...PTY_MODULES]) {
       const offenders = read(rel)
         .split('\n')
         .map((line, i) => ({ line, n: i + 1 }))
@@ -62,7 +65,6 @@ describe('hermetic wiring tripwire', () => {
 
   test('feature prompt acknowledgements are seeded in GSTACK_HOME everywhere', () => {
     const markers = [
-      '.feature-prompted-continuous-checkpoint',
       '.feature-prompted-model-overlay',
     ];
     // CI seeding lives in the composite action (v1.77 moved it out of the
@@ -88,11 +90,22 @@ describe('hermetic wiring tripwire', () => {
     }
   });
 
+  test('both EVALS_HERMETIC branches pin DISABLE_AUTOUPDATER=1 over the workflow env', () => {
+    // The allowlist scrubs the workflow's own copy; without this pin every PTY
+    // screen carries "Auto-update failed: no write permission to npm prefix".
+    for (const EVALS_HERMETIC of ['1', '0']) {
+      const base = { PATH: '/usr/bin', EVALS_HERMETIC, DISABLE_AUTOUPDATER: '0' };
+      expect(buildHermeticEnv(base, {}).DISABLE_AUTOUPDATER, `EVALS_HERMETIC=${EVALS_HERMETIC}`).toBe('1');
+      expect(buildHermeticEnv(base, {}, { DISABLE_AUTOUPDATER: '0' }).DISABLE_AUTOUPDATER, 'per-test override stays last').toBe('0');
+    }
+    expect(read('test/helpers/hermetic-env.ts')).toContain('DISABLE_AUTOUPDATER=1 (pinned in both branches');
+  });
+
   test('claude runners gate --strict-mcp-config on isHermeticEnabled()', () => {
     // Zero MCP servers for hermetic children; EVALS_HERMETIC=0 must restore
     // operator MCP along with the operator env (the flag may not be
     // unconditional, or the escape hatch lies).
-    for (const rel of ['test/helpers/session-runner.ts', 'test/helpers/claude-pty-runner.ts']) {
+    for (const rel of ['test/helpers/session-runner.ts', 'test/helpers/pty/launch.ts']) {
       const src = read(rel);
       expect(src.includes('--strict-mcp-config')).toBe(true);
       const gated =
@@ -145,8 +158,8 @@ describe('hermetic wiring tripwire', () => {
     // hermeticSkillsConfigDir() is a BLESSED non-hermetic edge: it registers
     // the LIVE repo tree's skills (the skills are the subject under test).
     // What it must never do is hand children the operator's ~/.claude — the
-    // seeded CLAUDE_CONFIG_DIR lives under the hermetic runRoot, and every
-    // registered symlink resolves into the repo checkout.
+    // seeded CLAUDE_CONFIG_DIR lives under the hermetic runRoot, while its
+    // registered documents link directly to the live checkout under test.
     const configDir = hermeticSkillsConfigDir();
     const { runRoot } = getHermeticDirs();
     const operatorClaude = path.join(os.homedir(), '.claude') + path.sep;
@@ -155,19 +168,28 @@ describe('hermetic wiring tripwire', () => {
     const skillsDir = path.join(configDir, 'skills');
     const repoRootReal = fs.realpathSync(ROOT) + path.sep;
     for (const entry of fs.readdirSync(skillsDir)) {
-      const target = fs.readlinkSync(path.join(skillsDir, entry, 'SKILL.md'));
-      const resolved = fs.realpathSync(target);
-      // Targets inside the live repo checkout are the blessed edge — exempt
-      // them BEFORE the operator-~/.claude ban. On the default global-git
-      // install the repo itself lives at ~/.claude/skills/gstack, so every
-      // CORRECT symlink carries the operatorClaude prefix and an unexempted
-      // ban can never pass (regression 2026-08-15: pristine v1.64.1.0 fails
-      // this test in any worktree under ~/.claude/skills/ and passes
-      // elsewhere — realpath both sides so a symlinked HOME can't dodge it).
-      if (!resolved.startsWith(repoRootReal)) {
-        expect(resolved.startsWith(operatorClaude), `${entry}: symlink escapes to ${target}`).toBe(false);
+      if (entry === 'gstack') {
+        const verifyRuntime = (directory: string) => {
+          expect(fs.lstatSync(directory).isDirectory()).toBe(true);
+          for (const name of fs.readdirSync(directory)) {
+            const file = path.join(directory, name);
+            if (fs.statSync(file).isDirectory()) verifyRuntime(file);
+            else {
+              expect(fs.lstatSync(file).isSymbolicLink()).toBe(true);
+              expect(fs.realpathSync(file).startsWith(repoRootReal), file).toBe(true);
+            }
+          }
+        };
+        verifyRuntime(path.join(skillsDir, entry));
+        continue;
       }
-      expect(resolved.startsWith(repoRootReal), `${entry}: symlink outside repo: ${target}`).toBe(true);
+      const link = path.join(skillsDir, entry, 'SKILL.md');
+      expect(fs.lstatSync(path.dirname(link)).isDirectory()).toBe(true);
+      expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
+      const target = fs.readlinkSync(link);
+      const resolved = fs.realpathSync(link);
+      expect(resolved.startsWith(operatorClaude), `${entry}: symlink escapes to ${target}`).toBe(false);
+      expect(resolved.startsWith(repoRootReal), `${entry}: symlink outside checkout: ${target}`).toBe(true);
     }
   });
 });

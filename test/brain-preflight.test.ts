@@ -18,6 +18,7 @@ import {
 import { SKILL_DIGEST_SUBSETS } from '../scripts/brain-cache-spec';
 import { HOST_PATHS } from '../scripts/resolvers/types';
 import type { TemplateContext } from '../scripts/resolvers/types';
+import { expectMentions } from './helpers/prompt-structure';
 
 function buildCtx(skillName: string): TemplateContext {
   return {
@@ -29,6 +30,11 @@ function buildCtx(skillName: string): TemplateContext {
 }
 
 describe('generateBrainPreflight', () => {
+  test('Eng scope selection precedes brain lookup without changing other planning entrypoints', () => {
+    expectMentions(generateBrainPreflight(buildCtx('plan-eng-review')), [['before', 'questions', 'review']], 'section');
+    expect(generateBrainPreflight(buildCtx('plan-eng-review'))).not.toContain('Before asking any clarifying questions');
+    expect(generateBrainPreflight(buildCtx('plan-ceo-review'))).toContain('Before asking any clarifying questions');
+  });
   test('emits content for every registered preflight skill', () => {
     for (const skill of Object.keys(SKILL_DIGEST_SUBSETS)) {
       const out = generateBrainPreflight(buildCtx(skill));

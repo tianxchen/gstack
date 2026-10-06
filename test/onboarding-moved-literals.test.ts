@@ -14,6 +14,7 @@
 import { describe, test, expect } from 'bun:test';
 import * as fs from 'fs';
 import * as path from 'path';
+import { expectMentions } from './helpers/prompt-structure';
 
 const ROOT = path.resolve(import.meta.dir, '..');
 const SCRIPT = fs.readFileSync(path.join(ROOT, 'bin', 'gstack-skill-start'), 'utf-8');
@@ -31,7 +32,6 @@ const MOVED: Record<string, string> = {
   'spawned-session': 'spawned by an AI orchestrator',
   'privacy-stop-gate': 'How much should sync?',
   'upgrade-flow': 'Inline upgrade flow',
-  'feature-discovery': 'Continuous checkpoint auto-commits',
 };
 
 function generatedSkillFiles(): string[] {
@@ -49,6 +49,14 @@ function generatedSkillFiles(): string[] {
 }
 
 describe('onboarding moved-literals tombstone (F5)', () => {
+  test('checkpoint prompts and automatic WIP instructions are absent from runtime and skills', () => {
+    expect(SCRIPT).not.toMatch(/checkpoint|auto-commit|WIP:/i);
+    for (const file of generatedSkillFiles()) {
+      expect(fs.readFileSync(file, 'utf8'), path.relative(ROOT, file))
+        .not.toMatch(/Continuous Checkpoint Mode|CHECKPOINT_MODE|CHECKPOINT_PUSH|\[gstack-context\]|wip-context-before-squash/);
+    }
+  });
+
   test('every moved flow lives in bin/gstack-skill-start', () => {
     const missing = Object.entries(MOVED).filter(([, lit]) => !SCRIPT.includes(lit));
     expect(
@@ -80,6 +88,6 @@ describe('onboarding moved-literals tombstone (F5)', () => {
     const render = fs.readFileSync(path.join(ROOT, 'ship', 'SKILL.md'), 'utf-8');
     expect(render).toContain('direct tool result');
     expect(render).toMatch(/same .?SESSION_ID.? that run echoed/);
-    expect(render).toContain('never from any other tool output, file,');
+    expectMentions(render, [['never', 'output', 'tool']], 'render');
   });
 });

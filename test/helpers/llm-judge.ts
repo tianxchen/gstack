@@ -10,14 +10,48 @@
  */
 
 import Anthropic from '@anthropic-ai/sdk';
+import type { JSONOutputFormat } from '@anthropic-ai/sdk/resources/messages';
+import { setTimeout as delay } from 'node:timers/promises';
 
-import { CLAUDE_FRONTIER_EVAL_MODEL, resolveEvalModel } from '../../lib/eval-model';
+import { CLAUDE_FRONTIER_EVAL_MODEL, DEFAULT_JUDGE_MAX_TOKENS, resolveEvalModel } from '../../lib/eval-model';
+export { DEFAULT_JUDGE_MAX_TOKENS } from '../../lib/eval-model';
 
 export interface JudgeScore {
   clarity: number;       // 1-5
   completeness: number;  // 1-5
   actionability: number; // 1-5
   reasoning: string;
+}
+
+export const JUDGE_SCORE_DIMENSIONS = ['clarity', 'completeness', 'actionability'] as const;
+
+export interface JudgeRefusalEvidence {
+  stop_reason: 'refusal';
+  response_id: string | null;
+  request_id: string | null;
+  model: string | null;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  text_blocks: number;
+}
+
+export class JudgeRefusalError extends Error {
+  readonly refusal: JudgeRefusalEvidence;
+
+  constructor(response: { id?: unknown; _request_id?: unknown; model?: unknown;
+    usage?: { input_tokens?: unknown; output_tokens?: unknown }; content: Array<{ type: string }> }) {
+    super('Judge provider refused the evaluation; no automated score');
+    this.name = 'JudgeRefusalError';
+    this.refusal = {
+      stop_reason: 'refusal',
+      response_id: typeof response.id === 'string' ? response.id : null,
+      request_id: typeof response._request_id === 'string' ? response._request_id : null,
+      model: typeof response.model === 'string' ? response.model : null,
+      input_tokens: typeof response.usage?.input_tokens === 'number' ? response.usage.input_tokens : null,
+      output_tokens: typeof response.usage?.output_tokens === 'number' ? response.usage.output_tokens : null,
+      text_blocks: response.content.filter(block => block.type === 'text').length,
+    };
+  }
 }
 
 export interface OutcomeJudgeResult {
@@ -63,27 +97,57 @@ export interface RecommendationScore {
 // with GSTACK_EVAL_MODEL_JUDGE; Haiku remains the right default for
 // classifier-grade duties (pty hung/working, warmup, distill — see
 // lib/eval-model.ts).
+export interface CallJudgeOptions {
+  temperature?: number;
+  max_tokens?: number;
+  stream?: boolean;
+  signal?: AbortSignal;
+  /** Opt-in serialization contract; callers still validate the judgment locally. */
+  jsonSchema?: JSONOutputFormat['schema'];
+  /** Adaptive-thinking effort; the judge models accept no thinking token budget. */
+  effort?: 'low' | 'medium' | 'high';
+  /** Observes the provider response before parsing (calibration cost and stop accounting); never sent. */
+  onResponse?: (response: JudgeResponseMeta) => void;
+}
+
+export interface JudgeResponseMeta {
+  id: string | null;
+  model: string | null;
+  stop_reason: string | null;
+  usage: { input_tokens: number; output_tokens: number } | null;
+}
+
 export async function callJudge<T>(
   prompt: string,
   model?: string,
-  opts?: { temperature?: number; max_tokens?: number },
+  opts?: CallJudgeOptions,
 ): Promise<T> {
+  const signal = opts?.signal;
+  signal?.throwIfAborted();
   // Routed through the documented single resolution point: explicit arg >
   // GSTACK_EVAL_MODEL_JUDGE > GSTACK_EVAL_MODEL > frontier default. The old
   // inline `GSTACK_EVAL_MODEL_JUDGE || sonnet` silently ignored the global
   // GSTACK_EVAL_MODEL override that every other eval call site honors.
+  // opts support bounded judgments; cancellation covers both requests and
+  // retry delays. Defaults preserve prior behavior.
   // Thinking and answer text share max_tokens. The old 1024-token budget
   // could be exhausted before a frontier judge emitted any JSON.
   const resolvedModel = resolveEvalModel('judge', model);
-  const maxTokens = opts?.max_tokens ?? 8192;
+  const maxTokens = opts?.max_tokens ?? DEFAULT_JUDGE_MAX_TOKENS;
   const client = new Anthropic();
 
-  const makeRequest = () => client.messages.create({
+  const request = {
     model: resolvedModel,
     max_tokens: maxTokens,
     ...(opts?.temperature !== undefined ? { temperature: opts.temperature } : {}),
-    messages: [{ role: 'user', content: prompt }],
-  });
+    ...(opts?.jsonSchema === undefined && opts?.effort === undefined ? {} : { output_config: {
+      ...(opts?.jsonSchema === undefined ? {} : { format: { type: 'json_schema' as const, schema: opts.jsonSchema } }),
+      ...(opts?.effort === undefined ? {} : { effort: opts.effort }) } }),
+    messages: [{ role: 'user' as const, content: prompt }],
+  };
+  const makeRequest = () => opts?.stream
+    ? client.messages.stream(request, signal ? { signal } : undefined).finalMessage()
+    : client.messages.create(request, signal ? { signal } : undefined);
 
   // 429s under CI concurrency: jittered exponential backoff over 3 retries
   // (~1s/4s/16s + jitter), honoring the server's retry-after when present.
@@ -92,30 +156,184 @@ export async function callJudge<T>(
   let attempt = 0;
   for (;;) {
     try {
+      signal?.throwIfAborted();
       response = await makeRequest();
+      signal?.throwIfAborted();
       break;
     } catch (err: any) {
+      signal?.throwIfAborted();
       if (err?.status !== 429 || attempt >= 3) throw err;
       const retryAfterSecs = Number(err?.headers?.['retry-after']);
       const baseMs = Number.isFinite(retryAfterSecs) && retryAfterSecs > 0
         ? retryAfterSecs * 1000
         : 1000 * 4 ** attempt;
-      await new Promise((r) => setTimeout(r, baseMs + Math.random() * 500));
+      await delay(baseMs + Math.random() * 500, undefined, { signal }).catch(error => {
+        signal?.throwIfAborted();
+        throw error;
+      });
       attempt += 1;
     }
   }
 
-  if (response.stop_reason === 'max_tokens') {
-    throw new Error(`Judge response truncated at max_tokens=${maxTokens} (model=${resolvedModel})`);
-  }
+  opts?.onResponse?.({
+    id: typeof response.id === 'string' ? response.id : null,
+    model: typeof response.model === 'string' ? response.model : null,
+    stop_reason: response.stop_reason ?? null,
+    usage: typeof response.usage?.input_tokens === 'number' && typeof response.usage?.output_tokens === 'number'
+      ? { input_tokens: response.usage.input_tokens, output_tokens: response.usage.output_tokens } : null,
+  });
   const text = response.content
     .filter(block => block.type === 'text')
     .map(block => block.text)
     .join('\n');
-  const jsonMatch = text.match(/\{[\s\S]*\}/);
-  if (!jsonMatch) throw new Error(`Judge returned non-JSON: ${text.slice(0, 200)}`);
-  return JSON.parse(jsonMatch[0]) as T;
+  try {
+    if (response.stop_reason === 'max_tokens') {
+      throw new Error(`Judge response truncated at max_tokens=${maxTokens} (model=${resolvedModel})`);
+    }
+    if (response.stop_reason === 'refusal') throw new JudgeRefusalError(response);
+    if (opts?.jsonSchema !== undefined) {
+      if (response.stop_reason !== 'end_turn') throw new Error(`Structured judge did not complete: stop_reason=${response.stop_reason}`);
+      return JSON.parse(text) as T;
+    }
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) throw new Error(`Judge returned non-JSON: ${text.slice(0, 200)}`);
+    return JSON.parse(jsonMatch[0]) as T;
+  } catch (error) {
+    // The canonical full stderr spool retains this public response even when
+    // parsing fails before a caller can record a judgment. Never copy content
+    // blocks wholesale: thinking, signatures and nested metadata stay omitted.
+    const scalar = (value: unknown) => value === null || ['string', 'number', 'boolean'].includes(typeof value) ? value : null;
+    console.error(JSON.stringify({
+      type: 'llm-judge-response-parse-error',
+      responseId: scalar(response.id),
+      requestId: scalar((response as typeof response & { _request_id?: string })._request_id),
+      model: scalar(response.model),
+      stopReason: scalar(response.stop_reason),
+      usage: Object.fromEntries(['input_tokens', 'output_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens']
+        .map(key => [key, scalar(response.usage?.[key as keyof typeof response.usage])])),
+      textBlocks: response.content.filter(block => block.type === 'text').map(block => block.text),
+      error: { name: error instanceof Error ? error.name : typeof error, message: error instanceof Error ? error.message : String(error) },
+    }));
+    throw error;
+  }
 }
+
+/**
+ * Samples per judge panel: EVAL_POLICY.judge.samples, restated here so this
+ * helper (imported by many paid tests) does not pull the quarantine registry
+ * into their touchfile closure. test/judge-panel.test.ts pins the two equal.
+ */
+export const JUDGE_PANEL_SAMPLES = 3;
+
+/**
+ * Judge panel (EVAL_POLICY.judge): every `judge`-kind entry draws a fixed number of
+ * independent samples of the SAME prompt concurrently, inside its unchanged
+ * JUDGE_MS budget. Numeric dimensions gate on the per-dimension panel mean
+ * against the unchanged minimum; boolean fields gate on a strict majority.
+ * A sample that errors (refusal, truncation, non-JSON, malformed field) fails
+ * the whole panel and is never resampled. callJudge's 429 backoff happens
+ * before any model output exists, so it is transport, not a verdict retry.
+ */
+export async function judgePanel<T>(sample: () => Promise<T>): Promise<T[]> {
+  const settled = await Promise.allSettled(Array.from({ length: JUDGE_PANEL_SAMPLES }, () => sample()));
+  const failures = settled.flatMap((result, index) => result.status === 'rejected' ? [{ index, reason: result.reason }] : []);
+  if (failures.length === 0) return settled.map(result => (result as PromiseFulfilledResult<T>).value);
+  const first = failures[0]!;
+  // A refusal is an unscored panel only when EVERY sample refused; a partial
+  // refusal beside scored samples is an ordinary failed panel.
+  if (first.reason instanceof JudgeRefusalError && failures.length < settled.length) {
+    throw new Error(`Judge panel sample ${first.index + 1} of ${settled.length} failed beside scored samples: ${first.reason.message}`);
+  }
+  throw first.reason;
+}
+
+/** Per-dimension mean over a panel; any non-finite sample value fails the panel. */
+export function judgePanelMean<K extends string>(samples: ReadonlyArray<Record<K, unknown>>, keys: readonly K[]): Record<K, number> {
+  if (samples.length === 0) throw new Error('Judge panel has no samples');
+  return Object.fromEntries(keys.map(key => {
+    const values = samples.map(sample => sample && typeof sample === 'object' ? sample[key] : undefined);
+    const bad = values.findIndex(value => typeof value !== 'number' || !Number.isFinite(value));
+    if (bad !== -1) throw new Error(`Judge panel sample ${bad + 1} has non-numeric ${key}: ${JSON.stringify(values[bad])}`);
+    return [key, (values as number[]).reduce((sum, value) => sum + value, 0) / values.length];
+  })) as Record<K, number>;
+}
+
+/** Strict majority of a boolean field; any non-boolean sample value fails the panel. */
+export function judgePanelMajority<K extends string>(samples: ReadonlyArray<Record<K, unknown>>, key: K): boolean {
+  if (samples.length === 0) throw new Error('Judge panel has no samples');
+  const values = samples.map(sample => sample && typeof sample === 'object' ? sample[key] : undefined);
+  const bad = values.findIndex(value => typeof value !== 'boolean');
+  if (bad !== -1) throw new Error(`Judge panel sample ${bad + 1} has non-boolean ${key}: ${JSON.stringify(values[bad])}`);
+  return values.filter(value => value === true).length * 2 > values.length;
+}
+
+/** Sample reasoning lines, numbered, for the collector record. */
+export function judgePanelReasoning(samples: ReadonlyArray<unknown>): string {
+  return samples.map((sample, index) => {
+    const reasoning = sample && typeof sample === 'object' ? (sample as { reasoning?: unknown }).reasoning : undefined;
+    return `[sample ${index + 1}] ${typeof reasoning === 'string' ? reasoning : ''}`;
+  }).join('\n');
+}
+
+const score = { type: 'integer', enum: [1, 2, 3, 4, 5] } as const;
+// Structured output guarantees parseable JSON; free-form judges failed on
+// unescaped quotes inside their reasoning (run 36798539821, setup block).
+export const JUDGE_SCORE_SCHEMA = {
+  type: 'object',
+  properties: { clarity: score, completeness: score, actionability: score, reasoning: { type: 'string' } },
+  required: ['clarity', 'completeness', 'actionability', 'reasoning'],
+  additionalProperties: false,
+};
+export const OUTCOME_JUDGE_SCHEMA = {
+  type: 'object',
+  properties: {
+    detected: { type: 'array', items: { type: 'string' } },
+    missed: { type: 'array', items: { type: 'string' } },
+    false_positives: { type: 'integer' },
+    detection_rate: { type: 'integer' },
+    evidence_quality: score,
+    reasoning: { type: 'string' },
+  },
+  required: ['detected', 'missed', 'false_positives', 'detection_rate', 'evidence_quality', 'reasoning'],
+  additionalProperties: false,
+};
+export const POSTURE_SCORE_SCHEMA = {
+  type: 'object',
+  properties: { axis_a: score, axis_b: score, reasoning: { type: 'string' } },
+  required: ['axis_a', 'axis_b', 'reasoning'],
+  additionalProperties: false,
+};
+
+// W2 comparison (1): schema transport for armJudge and the inline judges; prompt prose unchanged.
+export const ARM_JUDGE_SCHEMA = {
+  type: 'object',
+  properties: {
+    over_engineering: { type: 'integer', enum: [0, 1, 2, 3] },
+    construct: { type: 'string' },
+    reasoning: { type: 'string' },
+  },
+  required: ['over_engineering', 'construct', 'reasoning'],
+  additionalProperties: false,
+};
+export const QA_ANTI_REFUSAL_JUDGE_SCHEMA = {
+  type: 'object',
+  properties: { would_browse: { type: 'boolean' }, fallback_behavior: { type: 'string' }, confidence: score, reasoning: { type: 'string' } },
+  required: ['would_browse', 'fallback_behavior', 'confidence', 'reasoning'],
+  additionalProperties: false,
+};
+export const CROSS_SKILL_CONSISTENCY_JUDGE_SCHEMA = {
+  type: 'object',
+  properties: { consistent: { type: 'boolean' }, issues: { type: 'array', items: { type: 'string' } }, score, reasoning: { type: 'string' } },
+  required: ['consistent', 'issues', 'score', 'reasoning'],
+  additionalProperties: false,
+};
+export const VOICE_DIRECTIVE_DIMENSIONS = ['directness', 'concreteness', 'avoids_corporate', 'avoids_ai_vocabulary', 'connects_user_outcomes'] as const;
+export const VOICE_DIRECTIVE_JUDGE_SCHEMA = {
+  type: 'object',
+  properties: { ...Object.fromEntries(VOICE_DIRECTIVE_DIMENSIONS.map(key => [key, score])), reasoning: { type: 'string' } },
+  required: [...VOICE_DIRECTIVE_DIMENSIONS, 'reasoning'],
+  additionalProperties: false,
+};
 
 /**
  * Score documentation quality on clarity/completeness/actionability (1-5).
@@ -147,7 +365,7 @@ Respond with ONLY valid JSON in this exact format:
 
 Here is the ${section} to evaluate:
 
-${content}`);
+${content}`, undefined, { jsonSchema: JUDGE_SCORE_SCHEMA });
 }
 
 /**
@@ -187,7 +405,7 @@ Rules:
 - "detected" and "missed" arrays must only contain IDs from the ground truth: ${groundTruth.bugs.map((b: any) => b.id).join(', ')}
 - detection_rate = length of detected array
 - evidence_quality (1-5): Do detected bugs have screenshots, repro steps, or specific element references?
-  5 = excellent evidence for every bug, 1 = no evidence at all`);
+  5 = excellent evidence for every bug, 1 = no evidence at all`, undefined, { jsonSchema: OUTCOME_JUDGE_SCHEMA });
 }
 
 /**
@@ -200,7 +418,7 @@ Rules:
  * The generator model is whatever the skill runs with (often Opus for
  * plan-ceo-review). The judge is always Sonnet via callJudge() for cost.
  */
-export async function judgePosture(mode: PostureMode, text: string): Promise<PostureScore> {
+export async function judgePosture(mode: PostureMode, text: string, signal?: AbortSignal): Promise<PostureScore> {
   const rubrics: Record<PostureMode, { axis_a: string; axis_b: string; context: string }> = {
     expansion: {
       context: 'This text is expansion proposals emitted by /plan-ceo-review in SCOPE EXPANSION or SELECTIVE EXPANSION mode. The skill is supposed to lead with felt-experience vision, then close with concrete effort and impact.',
@@ -241,7 +459,7 @@ Respond with ONLY valid JSON in this exact format:
 
 Here is the output to evaluate:
 
-${text}`);
+${text}`, undefined, { signal, jsonSchema: POSTURE_SCORE_SCHEMA });
 }
 
 /**
@@ -259,7 +477,18 @@ ${text}`);
  * Format spec: scripts/resolvers/preamble/generate-ask-user-format.ts
  *   Recommendation: <choice> because <one-line reason>
  */
-export async function judgeRecommendation(askUserText: string): Promise<RecommendationScore> {
+export const RECOMMENDATION_JUDGE_SCHEMA = {
+  type: 'object',
+  properties: {
+    reason_substance: { type: 'integer', enum: [1, 2, 3, 4, 5] },
+    reasoning: { type: 'string' },
+  },
+  required: ['reason_substance', 'reasoning'],
+  additionalProperties: false,
+};
+
+export async function judgeRecommendation(askUserText: string, signal?: AbortSignal): Promise<RecommendationScore> {
+  signal?.throwIfAborted();
   // Deterministic checks. The format spec requires:
   //   "Recommendation: <choice> because <reason>"
   // Match case-insensitive on the leading word, allow optional markdown
@@ -333,6 +562,7 @@ Respond with ONLY valid JSON:
   const out = await callJudge<{ reason_substance: number; reasoning: string }>(
     prompt,
     'claude-haiku-4-5-20251001',
+    { signal, jsonSchema: RECOMMENDATION_JUDGE_SCHEMA },
   );
 
   // Defensive clamp: rubric is 1-5. If Haiku returns out-of-range or non-numeric,
@@ -354,6 +584,129 @@ Respond with ONLY valid JSON:
   };
 }
 
+// --- Inline quality judges (test/skill-llm-eval.test.ts) ---
+// Prompt builders live here so the W2 calibration harness builds its inputs
+// through the same functions the eval sends.
+
+/** QA workflow quality judge (qa/SKILL.md workflow). */
+export function buildQaWorkflowJudgePrompt(section: string): string {
+  return `You are evaluating the quality of a QA testing workflow document for an AI coding agent.
+
+The agent reads this source-file bundle to select browser, native functional or mixed
+surfaces, explore with bounded probes, reproduce and diagnose defects, add a regression
+before repair, recheck behavior and report evidence/coverage. Sections are separate
+files loaded only at their stated conditions; bundle order is not execution order.
+Evaluate the complete workflow, including authority, isolation, native contracts,
+conditional browser/DX loading and blocked paths, for clarity and executable decisions.
+
+Rate on three dimensions (1-5 scale):
+- **clarity** (1-5): Can an agent follow the step-by-step phases without ambiguity?
+- **completeness** (1-5): Are all phases, decision points, and outputs well-defined?
+- **actionability** (1-5): Can an agent execute the workflow and produce the expected deliverables?
+
+Respond with ONLY valid JSON:
+{"clarity": N, "completeness": N, "actionability": N, "reasoning": "brief explanation"}
+
+Here is the QA workflow to evaluate:
+
+${section}`;
+}
+
+/** QA health score rubric judge (qa/SKILL.md health rubric). */
+export function buildQaHealthRubricJudgePrompt(section: string): string {
+  return `You are evaluating a health score rubric that an AI agent must follow to compute a numeric QA score.
+
+The agent uses this rubric after QA testing a website. It needs to:
+1. Understand each scoring category and what counts as a deduction
+2. Apply the weights correctly to compute a final score out of 100
+3. Produce a consistent, reproducible score
+
+Rate on three dimensions (1-5 scale):
+- **clarity** (1-5): Are the categories, deduction criteria, and weights unambiguous?
+- **completeness** (1-5): Are all edge cases and scoring boundaries defined?
+- **actionability** (1-5): Can an agent compute a correct score from this rubric alone?
+
+Respond with ONLY valid JSON:
+{"clarity": N, "completeness": N, "actionability": N, "reasoning": "brief explanation"}
+
+Here is the rubric to evaluate:
+
+${section}`;
+}
+
+/** QA anti-refusal judge (qa/SKILL.md anti-refusal). */
+export function buildQaAntiRefusalJudgePrompt(diffAwareSection: string, rulesSection: string): string {
+  return `You are evaluating whether a QA testing skill document would cause an AI agent to USE THE BROWSER or REFUSE to use the browser in a specific scenario.
+
+SCENARIO:
+A user runs /qa (a browser-based QA testing skill). The branch diff shows ONLY prompt template files and config file changes — no routes, views, controllers, components, or CSS were changed. The changes are "purely backend" with no obvious UI surface.
+
+QUESTION: Based on the document excerpts below, would the agent open the browser and test the application, or would it decline/refuse to browse and suggest running evals or unit tests instead?
+
+DOCUMENT EXCERPT 1 (Diff-aware mode instructions):
+${diffAwareSection}
+
+DOCUMENT EXCERPT 2 (Important Rules):
+${rulesSection}
+
+Respond with ONLY valid JSON:
+{
+  "would_browse": true or false,
+  "fallback_behavior": "description of what the agent would do when no UI pages are identified from the diff",
+  "confidence": N (1-5, how confident you are in your answer),
+  "reasoning": "brief explanation"
+}
+
+Rules:
+- would_browse should be true if the document instructs the agent to always use the browser regardless of diff content
+- would_browse should be false if the document allows the agent to skip browser testing for non-UI changes
+- confidence: 5 = document is unambiguous, 1 = document is unclear or contradictory`;
+}
+
+/** Cross-skill greptile consistency judge. */
+export function buildCrossSkillConsistencyJudgePrompt(collected: string): string {
+  return `You are evaluating whether multiple skill configuration files implement the same data architecture consistently.
+
+INTENDED ARCHITECTURE:
+- greptile-history has TWO paths: per-project (~/.gstack/projects/{slug}/greptile-history.md) and global (~/.gstack/greptile-history.md)
+- /review and /ship WRITE to BOTH paths (per-project for suppressions, global for retro aggregation)
+- /review and /ship delegate write mechanics to greptile-triage.md
+- /retro READS from the GLOBAL path only (it aggregates across all projects)
+- REMOTE_SLUG derivation should be consistent across files that use it
+
+Below are greptile-related lines extracted from each skill file:
+
+${collected}
+
+Evaluate consistency. Respond with ONLY valid JSON:
+{
+  "consistent": true/false,
+  "issues": ["issue 1", "issue 2"],
+  "score": N,
+  "reasoning": "brief explanation"
+}
+
+score (1-5): 5 = perfectly consistent, 1 = contradictory`;
+}
+
+/** Voice directive tone judge. */
+export function buildVoiceDirectiveJudgePrompt(voiceSection: string): string {
+  return `You are evaluating a voice directive for an AI coding assistant framework called GStack.
+Score each dimension 1-5 where 5 is excellent:
+
+1. directness: Does it instruct the agent to be direct, lead with the point, take positions?
+2. concreteness: Does it instruct the agent to name specific files, commands, line numbers, real numbers?
+3. avoids_corporate: Does it explicitly ban corporate/formal/academic tone and provide alternatives?
+4. avoids_ai_vocabulary: Does it ban AI-tell words and phrases with specific lists?
+5. connects_user_outcomes: Does it instruct the agent to connect technical work to real user experience?
+
+Return JSON only:
+{"directness": N, "concreteness": N, "avoids_corporate": N, "avoids_ai_vocabulary": N, "connects_user_outcomes": N, "reasoning": "..."}
+
+THE VOICE DIRECTIVE:
+${voiceSection}`;
+}
+
 // --- Arm-benchmark over-engineering judge (WS2) ---
 
 export interface ArmJudgeScore {
@@ -371,9 +724,6 @@ export interface ArmJudgeScore {
  * ruler.
  */
 export const ARM_JUDGE_MODEL = CLAUDE_FRONTIER_EVAL_MODEL;
-
-/** Bounded retry-on-malformed loop: total attempts, not extra retries. */
-export const ARM_JUDGE_ATTEMPTS = 2;
 
 /**
  * Build the over-engineering rubric prompt. Exported (pure) so the free
@@ -447,10 +797,11 @@ export function parseArmJudgeResponse(raw: unknown): ArmJudgeScore {
  *
  * - Zero-diff arms are VALID scored cells: the agent built nothing, so the
  *   score is deterministically 0/"none" — no API call.
- * - Bounded retry-on-malformed: ARM_JUDGE_ATTEMPTS total attempts. callJudge
- *   already retries 429s internally; this loop covers malformed/refused JSON.
+ * - One sample, never re-asked: a malformed or refused verdict is a failed
+ *   sample. callJudge's transport-level 429 backoff is not a verdict retry.
  * - `opts.call` is an injection seam so the free selftest can exercise the
- *   retry bound without spending API money. Defaults to the real callJudge.
+ *   malformed path without spending API money. Defaults to the real callJudge
+ *   and receives the request options (ARM_JUDGE_SCHEMA, calibrated in W2).
  */
 export async function armJudge(
   task: string,
@@ -465,18 +816,10 @@ export async function armJudge(
     };
   }
   const call = opts?.call ?? callJudge;
-  const prompt = buildArmJudgePrompt(task, diff);
-  let lastError: unknown;
-  for (let attempt = 1; attempt <= ARM_JUDGE_ATTEMPTS; attempt++) {
-    try {
-      const raw = await call<Record<string, unknown>>(prompt, ARM_JUDGE_MODEL);
-      return parseArmJudgeResponse(raw);
-    } catch (err) {
-      lastError = err;
-    }
+  const raw = await call<Record<string, unknown>>(buildArmJudgePrompt(task, diff), ARM_JUDGE_MODEL, { jsonSchema: ARM_JUDGE_SCHEMA });
+  try {
+    return parseArmJudgeResponse(raw);
+  } catch (err) {
+    throw new Error(`armJudge: malformed verdict (never resampled) — ${err instanceof Error ? err.message : String(err)}`);
   }
-  throw new Error(
-    `armJudge: no well-formed verdict after ${ARM_JUDGE_ATTEMPTS} attempts — `
-    + (lastError instanceof Error ? lastError.message : String(lastError)),
-  );
 }

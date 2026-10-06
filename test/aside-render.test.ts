@@ -6,7 +6,7 @@
  * installed and open (macOS dev machines); the live fallback render runs
  * wherever a browse binary resolves (Linux CI builds one via build:gates).
  */
-import { describe, test, expect, beforeAll, afterAll, setDefaultTimeout } from 'bun:test';
+import { describe, test, expect, beforeAll, afterAll, setDefaultTimeout, spyOn } from 'bun:test';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -114,8 +114,7 @@ async function liveRoundTrip(engine: 'aside' | 'browse', renderFn: typeof render
       ],
       timeoutMs: 90_000,
     });
-    expect(out.error).toBeUndefined();
-    expect(out.ok).toBe(true);
+    expectOk(out);
     expect(out.engine).toBe(engine);
     expect(out.outputs).toEqual([path.join(dir, 'out.pdf'), path.join(dir, 'm.jpg'), path.join(dir, 'v.txt'), path.join(dir, 'bytes.bin')]);
     expect(fs.readFileSync(path.join(dir, 'out.pdf')).subarray(0, 4).toString()).toBe('%PDF');
@@ -135,8 +134,7 @@ async function lateReadiness(engine: 'aside' | 'browse', renderFn: typeof render
   fs.writeFileSync(path.join(dir, 'late.html'), '<!doctype html><title>Late</title><body><script>setTimeout(() => { window.later = { ok: true }; }, 800);</script></body>');
   try {
     const out = await renderFn({ file: path.join(dir, 'late.html'), waitFor: { expression: 'window.later.ok', timeoutMs: 10_000 }, steps: [{ kind: 'eval', expression: 'document.title' }], timeoutMs: 60_000 });
-    expect(out.error).toBeUndefined();
-    expect(out.ok).toBe(true);
+    expectOk(out);
     expect(out.engine).toBe(engine);
     expect(out.evals[0]).toBe('Late');
   } finally {
@@ -237,11 +235,12 @@ describe('aside-render: live fallback render (needs a browse binary)', () => {
   const bin = resolveBrowseBin();
   // A binary on disk is not a reachable daemon: warm it up first (the first
   // command auto-starts the server) and skip, never fail, when it cannot come
-  // up — a cold daemon is an environment fact, not a renderer defect.
+  // up — a cold daemon is an environment fact, not a renderer defect. Listing
+  // tabs must not navigate the active tab: another shard may be rendering in it.
   let daemonUp = false;
   if (bin) {
     for (let attempt = 0; attempt < 2 && !daemonUp; attempt++) {
-      const r = spawnSync(bin, ['goto', 'about:blank'], { encoding: 'utf8', timeout: 90_000 });
+      const r = spawnSync(bin, ['tabs'], { encoding: 'utf8', timeout: 90_000 });
       daemonUp = r.status === 0;
     }
     if (!daemonUp) console.warn('[aside-render] browse daemon did not come up after two attempts — live fallback cases skipped');
@@ -318,7 +317,32 @@ const expectOk = (r: RenderResult): void => {
 // not latency. Bun's 5s default once failed a CI run whose render was merely slow
 // under a full six-shard load, so the budget is generous and hangs still fail.
 setDefaultTimeout(30_000);
-const browseWorkDirs = (): string[] => fs.readdirSync(SAFE_TMP_DIR).filter((n) => n.startsWith('gstack-render-browse-'));
+
+/** Check this render's staging directory, regardless of other renders using /tmp. */
+async function renderCheckingCleanup(spec: RenderSpec, bin: string, renderFn = renderWithBrowse): Promise<RenderResult> {
+  const workDirs: string[] = [];
+  const mkdtemp = fs.mkdtempSync;
+  // The renderer allocates before its first await. Observe that synchronous
+  // call, then restore immediately so unrelated async work is never captured.
+  const allocation = spyOn(fs, 'mkdtempSync').mockImplementation(((...args: Parameters<typeof fs.mkdtempSync>) => {
+    const dir = mkdtemp(...args);
+    if (args[0] === path.join(SAFE_TMP_DIR, 'gstack-render-browse-')) workDirs.push(dir.toString());
+    return dir;
+  }) as typeof fs.mkdtempSync);
+  let pending: Promise<RenderResult>;
+  try {
+    pending = renderFn(spec, bin);
+  } finally {
+    allocation.mockRestore();
+  }
+  try {
+    return await pending;
+  } finally {
+    // A changed allocation boundary must fail, not silently skip leak checks.
+    expect(workDirs, 'expected to observe this render\'s staging directory').toHaveLength(1);
+    for (const dir of workDirs) expect(fs.existsSync(dir), `render leaked staging directory: ${dir}`).toBe(false);
+  }
+}
 
 /** The subprocess driver: one job per process, so the module's engine cache and the spawn-time PATH are both under the test's control. */
 function writeDriver(dir: string): string {
@@ -343,7 +367,7 @@ process.exit(0);
 
 function runDriver<T>(driver: string, job: Record<string, unknown>, opts: { binDir?: string; env?: Record<string, string> } = {}): T {
   const env: Record<string, string> = { ...(process.env as Record<string, string>), PATH: opts.binDir ? `${opts.binDir}:${SYSTEM_PATH}` : SYSTEM_PATH };
-  for (const k of ['GSTACK_SKIP_ASIDE', 'GSTACK_BROWSE_BIN', 'BROWSE_BIN']) delete env[k]; // the operator's shell must not steer the fakes
+  for (const k of ['GSTACK_SKIP_ASIDE', 'GSTACK_BROWSE_BIN', 'BROWSE_BIN', 'GSTACK_RENDER_SLACK_MS']) delete env[k]; // the operator's shell must not steer the fakes
   Object.assign(env, opts.env ?? {});
   // process.execPath: an absolute bun, since the child PATH deliberately omits the operator's bin dirs. cwd is the temp dir so no repo .env is auto-loaded.
   const r = spawnSync(process.execPath, [driver, JSON.stringify(job)], { encoding: 'utf8', timeout: 60_000, cwd: path.dirname(driver), env });
@@ -656,10 +680,47 @@ describe.skipIf(!HERMETIC)('aside-render: renderWithBrowse — daemon CLI contra
   };
   const T = '--tab-id 7';
 
+  test('cleanup remains verifiable when another render removes its staging directory', async () => {
+    const sibling = fs.mkdtempSync(path.join(SAFE_TMP_DIR, 'gstack-render-browse-'));
+    try {
+      // Synchronize the other render's cleanup with our newtab command, so
+      // this reproduces the shared-/tmp race without relying on timing.
+      const b = fake({ newtab: `rmdir '${sibling.replaceAll("'", "'\\''")}'\necho '{"tabId":7}'` });
+      const r = await renderCheckingCleanup({ file: doc, steps: [] }, b);
+      expectOk(r);
+      expect(fs.existsSync(sibling)).toBe(false);
+    } finally {
+      fs.rmSync(sibling, { recursive: true, force: true });
+    }
+  });
+
+  test('cleanup leaves another render\'s new staging directory intact', async () => {
+    const sibling = fs.mkdtempSync(path.join(SAFE_TMP_DIR, 'gstack-render-browse-'));
+    fs.rmdirSync(sibling);
+    try {
+      const b = fake({ newtab: `mkdir '${sibling.replaceAll("'", "'\\''")}'\necho '{"tabId":7}'` });
+      expectOk(await renderCheckingCleanup({ file: doc, steps: [] }, b));
+      expect(fs.existsSync(sibling)).toBe(true);
+    } finally {
+      fs.rmSync(sibling, { recursive: true, force: true });
+    }
+  });
+
+  test('cleanup check still rejects an owned staging directory leak', async () => {
+    let leaked: string | undefined;
+    try {
+      await expect(renderCheckingCleanup({ file: doc, steps: [] }, 'unused', async () => {
+        leaked = fs.mkdtempSync(path.join(SAFE_TMP_DIR, 'gstack-render-browse-'));
+        return { ok: true, engine: 'browse', outputs: [], evals: {}, stdout: '' };
+      })).rejects.toThrow('render leaked staging directory');
+    } finally {
+      if (leaked) fs.rmSync(leaked, { recursive: true, force: true });
+    }
+  });
+
   test('happy path: newtab → goto <nonce URL> → per-step CLI calls → closetab; artifacts copied, evals inline, work dir and server released', async () => {
-    const before = browseWorkDirs();
     const b = fake();
-    const r = await renderWithBrowse({
+    const r = await renderCheckingCleanup({
       file: doc,
       steps: [
         { kind: 'pdf', out: path.join(outDir, 'doc.pdf'), options: { paperWidth: 8.5, paperHeight: 11 } },
@@ -693,23 +754,19 @@ describe.skipIf(!HERMETIC)('aside-render: renderWithBrowse — daemon CLI contra
     const payload = fs.readFileSync(`${log}.payloads`, 'utf8');
     expect(payload).toContain('"width":"8.5in"');
     expect(payload).toMatch(/"output":"\/tmp\/gstack-render-browse-[^"]+\/gstack-render-0\.pdf"/);
-    expect(browseWorkDirs()).toEqual(before); // /tmp staging dir removed
     await expect(fetch(goto.slice('goto '.length, -` ${T}`.length))).rejects.toThrow(); // loopback server stopped
   });
 
   test('`newtab --json` without a tabId → the named error, no closetab, no staging dir left in /tmp', async () => {
-    const before = browseWorkDirs();
-    const r = await renderWithBrowse({ file: doc, steps: [{ kind: 'eval', expression: '1' }] }, fake({ newtab: `echo '{"ok":true}'` }));
+    const r = await renderCheckingCleanup({ file: doc, steps: [{ kind: 'eval', expression: '1' }] }, fake({ newtab: `echo '{"ok":true}'` }));
     expect(r.ok).toBe(false);
     expect(r.engine).toBe('browse');
     expect(r.error).toBe('browse newtab --json returned no tabId');
     expect(readLines(log)).toEqual(['newtab --json']);
-    expect(browseWorkDirs()).toEqual(before);
   });
 
   test('a failing goto → "browse goto failed: <first stderr line>", the tab is still closed, /tmp is left clean', async () => {
-    const before = browseWorkDirs();
-    const r = await renderWithBrowse({ file: doc, steps: [{ kind: 'pdf', out: path.join(outDir, 'x.pdf') }] }, fake({ goto: 'echo "net::ERR_CONNECTION_REFUSED at http://127.0.0.1" >&2; echo "second line" >&2; exit 1' }));
+    const r = await renderCheckingCleanup({ file: doc, steps: [{ kind: 'pdf', out: path.join(outDir, 'x.pdf') }] }, fake({ goto: 'echo "net::ERR_CONNECTION_REFUSED at http://127.0.0.1" >&2; echo "second line" >&2; exit 1' }));
     expect(r.ok).toBe(false);
     expect(r.error!.startsWith('browse goto failed:')).toBe(true);
     expect(r.error).toContain('net::ERR_CONNECTION_REFUSED');
@@ -719,7 +776,6 @@ describe.skipIf(!HERMETIC)('aside-render: renderWithBrowse — daemon CLI contra
     expect(lines.some((l) => l.startsWith('goto '))).toBe(true);
     expect(lines.at(-1)).toBe('closetab 7');
     expect(lines.some((l) => l.startsWith('pdf '))).toBe(false);
-    expect(browseWorkDirs()).toEqual(before);
     expect(fs.existsSync(path.join(outDir, 'x.pdf'))).toBe(false);
   });
 
@@ -803,19 +859,23 @@ describe.skipIf(!HERMETIC)('aside-render: renderWithBrowse — daemon CLI contra
 
   // runProc is not exported: its timeout + kill path is observed through a hanging fake.
   test('a CLI call that hangs past spec.timeoutMs is killed and reported as timed out — even when a grandchild keeps the pipes open', async () => {
-    const before = browseWorkDirs();
     // `sleep` is a CHILD of the sh fake, so SIGTERM kills sh while sleep still holds stdout/stderr:
-    // the read must give up on its own (timeout + 10s) rather than wait for EOF. 14s (not 30s) so no orphan outlives this file.
-    const b = fake({ newtab: 'sleep 14' });
+    // the read must give up on its own (timeout + slack, 1s here) rather than wait for EOF. 6s so no orphan outlives this file.
+    const b = fake({ newtab: 'sleep 6' });
     const t0 = Date.now();
-    const r = await renderWithBrowse({ file: doc, steps: [{ kind: 'eval', expression: '1' }], timeoutMs: 1_500 }, b);
+    process.env.GSTACK_RENDER_SLACK_MS = '1000';
+    let r: RenderResult;
+    try {
+      r = await renderCheckingCleanup({ file: doc, steps: [{ kind: 'eval', expression: '1' }], timeoutMs: 1_500 }, b);
+    } finally {
+      delete process.env.GSTACK_RENDER_SLACK_MS;
+    }
     const elapsed = Date.now() - t0;
     expect(r.ok).toBe(false);
     expect(r.error!.startsWith('browse newtab failed:')).toBe(true);
     expect(r.error).toContain('timed out');
     expect(elapsed).toBeLessThan(25_000);
     expect(readLines(log)).toEqual(['newtab --json']); // no tab → nothing to close
-    expect(browseWorkDirs()).toEqual(before);
   }, 40_000);
 
   test('a hanging CLI that honours SIGTERM is reaped promptly at the budget', async () => {
@@ -888,11 +948,11 @@ describe.skipIf(!HERMETIC)('aside-render: render() — mid-run fallback from Asi
   type Out = { results: RenderResult[]; chosenAfter: EngineChoice };
   const spec: RenderSpec = { file: doc, steps: [{ kind: 'pdf', out: pdfOut }], timeoutMs: 20_000 };
   /** Prime the engine cache to Aside inside the driver, then render with the given fake `aside` (null = none on PATH) and the fake browse reachable via GSTACK_BROWSE_BIN. */
-  const run = (asideRepl: string | null, s: RenderSpec = spec, repeat = 1): Out => {
+  const run = (asideRepl: string | null, s: RenderSpec = spec, repeat = 1, env: Record<string, string> = {}): Out => {
     fs.rmSync(browseLog, { force: true }); fs.rmSync(`${browseLog}.payloads`, { force: true });
     fs.rmSync(path.join(tmp, 'out'), { recursive: true, force: true });
     if (asideRepl === null) fs.rmSync(path.join(asideBin, 'aside'), { force: true }); else writeFakeAside(asideBin, { repl: asideRepl });
-    return runDriver<Out>(driver, { fn: 'render', primeAside: true, repeat, spec: s }, { binDir: asideBin, env: { GSTACK_BROWSE_BIN: fakeBrowse } });
+    return runDriver<Out>(driver, { fn: 'render', primeAside: true, repeat, spec: s }, { binDir: asideBin, env: { GSTACK_BROWSE_BIN: fakeBrowse, ...env } });
   };
 
   test('Aside chosen but its CLI cannot start → retried once on gstack\'s own browser, and browse stays chosen afterwards', () => {
@@ -935,8 +995,8 @@ describe.skipIf(!HERMETIC)('aside-render: render() — mid-run fallback from Asi
   });
 
   test('an Aside script that times out was already navigating → NOT retried (the page\'s failure), Aside stays chosen', () => {
-    // timeoutMs 100 + the process slack (10s) is the whole wait; exec so the kill closes the pipes at once.
-    const { results: [r], chosenAfter } = run('exec sleep 14', { ...spec, timeoutMs: 100 });
+    // timeoutMs 100 + the process slack (1s here) is the whole wait; exec so the kill closes the pipes at once.
+    const { results: [r], chosenAfter } = run('exec sleep 14', { ...spec, timeoutMs: 100 }, 1, { GSTACK_RENDER_SLACK_MS: '1000' });
     expect(r.ok).toBe(false);
     expect(r.engine).toBe('aside');
     expect(r.error!.startsWith('aside repl did not run: timed out after')).toBe(true);

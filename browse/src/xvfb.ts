@@ -57,6 +57,10 @@ export function shouldSpawnXvfb(env: NodeJS.ProcessEnv, platform: NodeJS.Platfor
  * on it (i.e., we can safely spawn a new Xvfb there).
  */
 export function isDisplayFree(displayNum: number): boolean {
+  for (const reservation of [`/tmp/.X11-unix/X${displayNum}`, `/tmp/.X${displayNum}-lock`]) {
+    try { if (fs.lstatSync(reservation, { throwIfNoEntry: false })) return false; }
+    catch { return false; }
+  }
   // xdpyinfo exits 0 if a display is reachable. Exit non-zero means no
   // server, which is what we want. xdpyinfo ships in x11-utils, which some
   // images with Xvfb still lack (first Linux CI run: ENOENT) — fall back to
@@ -68,8 +72,7 @@ export function isDisplayFree(displayNum: number): boolean {
     });
     return result.exitCode !== 0;
   } catch {
-    return !fs.existsSync(`/tmp/.X11-unix/X${displayNum}`)
-      && !fs.existsSync(`/tmp/.X${displayNum}-lock`);
+    return true;
   }
 }
 
@@ -176,16 +179,43 @@ export function isOurXvfb(pid: number, recordedStartTime: string): boolean {
  * Throws if Xvfb isn't installed (caller should print a platform-specific
  * install hint).
  */
+export class XvfbDisplayTakenError extends Error {}
+
 export async function spawnXvfb(displayNum: number): Promise<XvfbHandle> {
   const display = `:${displayNum}`;
+  if (!isDisplayFree(displayNum)) throw new XvfbDisplayTakenError(`X display ${display} is already reserved; refusing to replace it`);
+  if (!readPidStartTime(process.pid)) throw new Error('Cannot start Xvfb without process start-time ownership checks');
 
   // Spawn detached: Xvfb's lifetime is tied to whether we've explicitly
   // killed it via the handle's close() method, not to the parent process.
-  const proc = Bun.spawn(['Xvfb', display, '-screen', '0', '1920x1080x24', '-ac'], {
-    windowsHide: true,
-    stdio: ['ignore', 'ignore', 'ignore'],
-  });
+  // Startup stderr goes to a private file: a holder that takes the display and
+  // exits before we look leaves no lock behind, only Xvfb's own message.
+  const stderrDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-xvfb-'));
+  const stderrPath = path.join(stderrDir, 'stderr.log');
+  const stderrFd = fs.openSync(stderrPath, 'w', 0o600);
+  let proc: ReturnType<typeof Bun.spawn>;
+  try {
+    proc = Bun.spawn(['Xvfb', display, '-screen', '0', '1920x1080x24', '-ac'], {
+      windowsHide: true,
+      stdio: ['ignore', 'ignore', stderrFd],
+    });
+  } catch (err) {
+    fs.rmSync(stderrDir, { recursive: true, force: true });
+    throw err;
+  } finally {
+    fs.closeSync(stderrFd);
+  }
   proc.unref();
+  const startTime = readPidStartTime(proc.pid);
+  try {
+    return await awaitXvfbReady(proc, displayNum, startTime, stderrPath);
+  } finally {
+    fs.rmSync(stderrDir, { recursive: true, force: true });
+  }
+}
+
+async function awaitXvfbReady(proc: ReturnType<typeof Bun.spawn>, displayNum: number, startTime: string, stderrPath: string): Promise<XvfbHandle> {
+  const display = `:${displayNum}`;
 
   // Wait for the X server to become reachable — Xvfb takes a few hundred ms
   // to bind. Probe via xdpyinfo with retries.
@@ -193,18 +223,33 @@ export async function spawnXvfb(displayNum: number): Promise<XvfbHandle> {
   let ready = false;
   while (Date.now() < deadline) {
     await Bun.sleep(100);
-    if (!isDisplayFree(displayNum)) { ready = true; break; }
     // If Xvfb crashed during startup, fail fast.
     if (proc.exitCode != null) {
-      throw new Error(`Xvfb on ${display} exited during startup (code ${proc.exitCode}). Hint: install xvfb (apt-get install xvfb / yum install xorg-x11-server-Xvfb).`);
+      let stderr = '';
+      try { stderr = fs.readFileSync(stderrPath, 'utf8'); } catch {}
+      if (!isDisplayFree(displayNum) || /Server is already active for display/.test(stderr)) {
+        throw new XvfbDisplayTakenError(`X display ${display} was reserved by another X server during startup`);
+      }
+      const fatal = stderr.split('\n').map(line => line.replace(/^\(EE\)\s*/, '').trim()).filter(Boolean).slice(-3).join(' ');
+      throw new Error(`Xvfb on ${display} exited during startup (code ${proc.exitCode})${fatal ? `: ${fatal}` : ''}. Hint: install xvfb (apt-get install xvfb / yum install xorg-x11-server-Xvfb).`);
     }
+    let ownsLock = false;
+    try { ownsLock = Number(fs.readFileSync(`/tmp/.X${displayNum}-lock`, 'utf8').trim()) === proc.pid; } catch {}
+    if (!ownsLock || !isOurXvfb(proc.pid, startTime)) continue;
+    try {
+      ready = Bun.spawnSync(['xdpyinfo', '-display', display], {
+        windowsHide: true, stdout: 'ignore', stderr: 'ignore', timeout: 2000,
+      }).exitCode === 0;
+    } catch {
+      ready = fs.existsSync(`/tmp/.X11-unix/X${displayNum}`);
+    }
+    if (ready) break;
   }
   if (!ready) {
-    try { proc.kill('SIGKILL'); } catch { /* ignore */ }
+    cleanupXvfb({ pid: proc.pid, startTime, display });
     throw new Error(`Xvfb on ${display} never became reachable within 3s timeout`);
   }
 
-  const startTime = readPidStartTime(proc.pid);
   return {
     pid: proc.pid,
     startTime,
@@ -214,21 +259,47 @@ export async function spawnXvfb(displayNum: number): Promise<XvfbHandle> {
 }
 
 /**
+ * Pick-then-spawn races with any other allocator (a second daemon, a parallel
+ * test shard): both can see the same display free before either Xvfb takes its
+ * lock. The loser moves on to the next free display instead of failing.
+ */
+export async function spawnFreeXvfb(
+  rangeStart: number = DISPLAY_RANGE_START,
+  rangeEnd: number = DISPLAY_RANGE_END,
+): Promise<XvfbHandle> {
+  for (let n = pickFreeDisplay(rangeStart, rangeEnd); n != null; n = pickFreeDisplay(n + 1, rangeEnd)) {
+    try { return await spawnXvfb(n); }
+    catch (err) { if (!(err instanceof XvfbDisplayTakenError)) throw err; }
+  }
+  throw new Error(`no free X display in range :${rangeStart}-:${rangeEnd} — refusing to clobber existing X servers`);
+}
+
+/**
  * Cleanup an Xvfb child if it's still ours. Validates ownership first; if
  * the PID has been recycled or the cmdline doesn't match, leave it alone.
  *
  * Best-effort: never throws.
  */
+function isZombie(pid: number): boolean {
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    return stat.slice(stat.lastIndexOf(')') + 2).startsWith('Z');
+  } catch { return false; }
+}
+
 export function cleanupXvfb(state: { pid: number; startTime: string; display: string }): void {
   if (!state.pid) return;
   if (!isOurXvfb(state.pid, state.startTime)) return;
   try { safeKill(state.pid, 'SIGTERM'); } catch { /* swallow */ }
   // Wait briefly for Xvfb to exit, then SIGKILL if still alive.
+  // An exited child stays a zombie until our event loop reaps it, and this
+  // synchronous wait blocks that loop, so a zombie counts as exited here.
   const deadline = Date.now() + 1000;
   while (Date.now() < deadline) {
-    if (!isProcessAlive(state.pid)) break;
+    if (!isProcessAlive(state.pid) || isZombie(state.pid)) break;
+    Bun.sleepSync(10);
   }
-  if (isProcessAlive(state.pid)) {
+  if (isOurXvfb(state.pid, state.startTime)) {
     try { safeKill(state.pid, 'SIGKILL'); } catch { /* swallow */ }
   }
 }

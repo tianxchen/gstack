@@ -42,10 +42,13 @@ describe('windowsHide on Windows-reachable spawns (#1835)', () => {
     // isProcessAlive no longer spawns anything (signal-0 on every platform,
     // #1952) — process-liveness-windows.test.ts pins that it stays
     // subprocess-free, which is stronger than hiding a window.
-    // powershell DPAPI + tasklist in cookie import.
     const cookie = SRC('cookie-import-browser.ts');
     expectHideNearEvery(cookie, "'powershell'");
-    expectHideNearEvery(cookie, "'tasklist'");
+    expect(cookie).not.toContain("'tasklist'");
+    expectHideNearEvery(SRC('cookie-import-native.ts'), 'spawn(bunExecutable');
+    const worker = SRC('cookie-import-native-worker.ts');
+    expectHideNearEvery(worker, 'spawn(process.execPath');
+    expectHideNearEvery(worker, 'spawn(input.request.nodeExecutable');
   });
 
   test('icacls calls in file-permissions.ts pass windowsHide', () => {
@@ -61,6 +64,12 @@ describe('windowsHide on Windows-reachable spawns (#1835)', () => {
     // respawn is the symptom when the flag is dropped. Wider window: the
     // spawn's options object carries the full env wiring before the flag.
     expectHideNearEvery(SRC('terminal-agent-control.ts'), '(Bun as any).spawn(', 700);
+  });
+
+  test('terminal-agent spawn is detached on Windows so it outlives the CLI that started it (#2637)', () => {
+    const control = SRC('terminal-agent-control.ts');
+    const at = control.indexOf('(Bun as any).spawn(');
+    expect(control.slice(at, at + 1000)).toContain("detached: process.platform === 'win32'");
   });
 
   test('SWEEP: every direct child_process call in src/ passes windowsHide (#2160, #2415)', () => {

@@ -21,11 +21,12 @@ here usually trace to not understanding the cross-component flow.
 
 **Embedder terminal-agent ownership** (v1.42.1.0+, identity-based kill v1.44.0.0+).
 `buildFetchHandler` in `browse/src/server.ts` accepts `ServerConfig.ownsTerminalAgent?:
-boolean` (default `true`). When `true`, factory shutdown runs the full teardown:
-identity-based kill via `killAgentByRecord(readAgentRecord(stateDir))` from
-`browse/src/terminal-agent-control.ts` plus `safeUnlinkQuiet` on
-`<stateDir>/terminal-port`, `<stateDir>/terminal-internal-token`, and
-`<stateDir>/terminal-agent-pid` (the per-boot agent record introduced in v1.44).
+boolean` (default `true`). When `true`, factory shutdown acquires
+`acquireAgentStateLock(stateDir)` and checks daemon ownership. It removes
+`terminal-port`, `terminal-internal-token`, and the matching `terminal-agent-pid`
+record only when the recorded agent is absent, already dead, or confirmed stopped
+by `stopAgentByRecord`. Uncertain identity or exit, an unavailable lock, or
+successor-owned daemon state leaves those files intact.
 Embedders (e.g. the gbrowser phoenix overlay) that pre-launch their own PTY
 server must pass `false` so their discovery files survive gstack teardown cycles.
 The flag is the third caller-owned teardown gate in `ServerConfig` (alongside
@@ -161,5 +162,6 @@ file lost its only writer when sidebar-agent.ts was ripped, so the shield
 reported a permanent 'inactive' or a stale false-green 'protected' from
 leftover disk state. The live defenses (L1-L3 filters, L4 sidecar on the
 inject-scan path) report through their own call sites, never through
-/health. `browse/test/server-security-surface.test.ts` pins both the
-removal and the live L4 wiring. Do not re-document these as live.
+/health. `browse/test/extension-token.test.ts` pins the removal on the real
+/health body and `browse/test/pty-inject-scan.test.ts` pins the live L4
+wiring behaviorally. Do not re-document these as live.

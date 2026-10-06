@@ -4,6 +4,7 @@ import { createHash } from 'crypto';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
+import { discoverSectionTemplates, discoverTemplates } from '../scripts/discover-skills';
 
 const ROOT = path.resolve(import.meta.dir, '..');
 
@@ -77,6 +78,50 @@ describe('gen-skill-docs --out-dir (B2 render isolation)', () => {
     }
   });
 
+  test('brain-writeback fixture survives render cleanup without changing any source artifacts', () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-brain-fixture-'));
+    const stateDir = path.join(base, 'state');
+    const renderDir = path.join(base, 'render');
+    const workDir = path.join(base, 'work');
+    fs.mkdirSync(stateDir);
+    fs.mkdirSync(workDir);
+    const sourcePaths = [
+      ...discoverTemplates(ROOT).map(template => template.output),
+      ...discoverSectionTemplates(ROOT).map(template => template.output),
+      'gstack/llms.txt', 'agents-digest/gstack-AGENTS.md',
+    ];
+    const snapshot = () => sourcePaths.map(relative => {
+      const file = path.join(ROOT, relative);
+      return [relative, fs.existsSync(file) ? [hashFile(file), fs.statSync(file).mtimeMs] : null];
+    });
+    const before = snapshot();
+    try {
+      fs.writeFileSync(path.join(stateDir, 'gbrain-detection.json'), JSON.stringify({ gbrain_local_status: 'ok' }));
+      const result = spawnSync('bun', [
+        'run', 'scripts/gen-skill-docs.ts', '--host', 'claude', '--respect-detection',
+        '--out-dir', renderDir, '--link-root', workDir,
+      ], { cwd: ROOT, encoding: 'utf-8', timeout: 120_000, env: { ...process.env, GSTACK_HOME: stateDir } });
+      expect(result.status, result.stderr).toBe(0);
+      fs.cpSync(path.join(renderDir, 'office-hours'), path.join(workDir, 'office-hours'), { recursive: true });
+      fs.rmSync(renderDir, { recursive: true });
+
+      const skill = fs.readFileSync(path.join(workDir, 'office-hours', 'SKILL.md'), 'utf-8');
+      const sectionRefs = [...skill.matchAll(/Read `([^`]+\/office-hours\/sections\/[^`]+\.md)`/g)].map(match => match[1]);
+      expect(sectionRefs.length).toBeGreaterThan(0);
+      for (const file of sectionRefs) {
+        expect(file.startsWith(workDir + '/office-hours/sections/')).toBe(true);
+        expect(fs.existsSync(file)).toBe(true);
+      }
+      expect(skill).not.toContain(renderDir);
+      expect(skill).toContain('~/.claude/skills/gstack/bin/');
+      expect(fs.readFileSync(path.join(workDir, 'office-hours', 'sections', 'design-and-handoff.md'), 'utf-8'))
+        .toContain('gbrain put "office-hours/');
+      expect(snapshot()).toEqual(before);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+
   // #2692: the swap-in callers (setup, gstack-config gbrain-refresh) render
   // into claude.tmp.<pid> then RENAME it into place — so section refs must be
   // rewritten to the FINAL serving dir (--link-root), never the tmp out-dir,
@@ -136,6 +181,50 @@ describe('gen-skill-docs --out-dir (B2 render isolation)', () => {
       fs.rmSync(outDir, { recursive: true, force: true });
     }
   });
+
+  // W7 regression contract: ./setup now passes --model <overlay> to every
+  // Claude render, and the default overlay is `claude`. That is only safe if
+  // `--model claude` renders exactly what the render without --model did.
+  test('gen:skill-docs:user --host claude --model claude is byte-identical to the render without --model', () => {
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-home-'));
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-model-claude-'));
+    const linkRoot = path.join(base, 'render', 'claude');
+    const files = (dir: string): Map<string, string> => {
+      const out = new Map<string, string>();
+      const walk = (d: string) => {
+        for (const entry of fs.readdirSync(d, { withFileTypes: true })) {
+          const p = path.join(d, entry.name);
+          if (entry.isDirectory()) walk(p);
+          else out.set(path.relative(dir, p), hashFile(p));
+        }
+      };
+      walk(dir);
+      return out;
+    };
+    try {
+      fs.writeFileSync(
+        path.join(tmpHome, 'gbrain-detection.json'),
+        JSON.stringify({ gbrain_local_status: 'ok', gbrain_version: '9.9.9' }),
+      );
+      const render = (out: string, extra: string[]) => spawnSync(
+        'bun',
+        ['run', 'gen:skill-docs:user', '--host', 'claude', '--out-dir', out, '--link-root', linkRoot, ...extra],
+        { cwd: ROOT, encoding: 'utf-8', timeout: 120_000, env: { ...process.env, GSTACK_HOME: tmpHome } },
+      );
+      const plain = render(path.join(base, 'plain'), []);
+      expect(plain.status, plain.stderr).toBe(0);
+      const pinned = render(path.join(base, 'model-claude'), ['--model', 'claude']);
+      expect(pinned.status, pinned.stderr).toBe(0);
+      const a = files(path.join(base, 'plain'));
+      const b = files(path.join(base, 'model-claude'));
+      expect(a.size).toBeGreaterThan(50);
+      expect([...b.keys()].sort()).toEqual([...a.keys()].sort());
+      expect([...a].filter(([rel, hash]) => b.get(rel) !== hash).map(([rel]) => rel)).toEqual([]);
+    } finally {
+      fs.rmSync(tmpHome, { recursive: true, force: true });
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  }, 240_000);
 
   // ── External-host out-dir cases ─────────────────────────────
   // The former tree-mutating tests read codex/factory artifacts from out-dir

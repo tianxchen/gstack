@@ -3,9 +3,11 @@
  * used to live.
  *
  * Every field a host doesn't override gets the common external-host default:
+ * tier 'experimental' with conservative capabilities (tool execution and
+ * browser, prose questions, no plan mode, no delegation, advisory safety),
  * paths derived from the host name (`.{name}/skills/gstack`), allowlist
- * frontmatter (name + description), no metadata sidecar, skip the codex
- * skill, the standard three-entry pathRewrite trio derived from the resolved
+ * frontmatter (name + description), no metadata sidecar, all skills enabled,
+ * the standard three-entry pathRewrite trio derived from the resolved
  * paths, the shared runtimeRoot asset list, and symlink-generated install.
  *
  * Defaults are constructed fresh per call, so no two host configs ever share
@@ -20,15 +22,15 @@ type PathRewrite = { from: string; to: string };
 
 /**
  * Preamble resolvers that orchestrate cross-model second opinions (they shell
- * out to Codex or spin up the review army). Suppressed on hosts that can't or
- * shouldn't invoke other models — Codex itself (can't invoke itself) and the
- * non-Claude agent runtimes (OpenClaw, Hermes, GBrain).
+ * out to the selected outside provider or spin up the review army). Suppressed
+ * on the non-Claude agent runtimes that already opt out (OpenClaw, Hermes,
+ * GBrain). Codex keeps the outside-provider resolvers and suppresses only army.
  */
 export const CROSS_MODEL_RESOLVERS: string[] = [
-  'DESIGN_OUTSIDE_VOICES',  // design.ts — invokes Codex for outside voices
-  'ADVERSARIAL_STEP',       // review.ts — invokes Codex adversarially
-  'CODEX_SECOND_OPINION',   // review.ts — invokes Codex
-  'CODEX_PLAN_REVIEW',      // review.ts — invokes Codex
+  'DESIGN_OUTSIDE_VOICES',  // design.ts — selected outside provider
+  'ADVERSARIAL_STEP',       // review.ts — adversarial outside review
+  'CODEX_SECOND_OPINION',   // review.ts — legacy token, selected provider
+  'CODEX_PLAN_REVIEW',      // review.ts — legacy token, selected provider
   'REVIEW_ARMY',            // review-army.ts — multi-model orchestration
 ];
 
@@ -62,6 +64,16 @@ export const EXEC_STYLE_TOOL_REWRITES: Record<string, string> = {
 };
 
 /**
+ * Prepend a one-paragraph tool-name glossary to the preamble's STATUS rules
+ * (spread into `toolRewrites`). For hosts whose native tools differ from the
+ * Claude names the shared prose uses; test/host-config.test.ts pins the anchor.
+ */
+export const PREAMBLE_GLOSSARY_ANCHOR = 'Read the echoed `KEY: value` STATUS lines';
+export function preambleToolGlossary(glossary: string): Record<string, string> {
+  return { [PREAMBLE_GLOSSARY_ANCHOR]: `${glossary}\n\n${PREAMBLE_GLOSSARY_ANCHOR}` };
+}
+
+/**
  * Host definition input: name + displayName are required, everything else is
  * an override on the common external-host defaults documented above.
  *
@@ -87,6 +99,15 @@ export function defineHost<const N extends string>(overrides: HostOverrides<N>):
     cliCommand = name,
     cliAliases = [],
     defaultModel = 'claude',
+    tier = 'experimental',
+    capabilities = {
+      toolExecution: true,
+      questions: 'prose',
+      planMode: false,
+      delegation: false,
+      browser: true,
+      safetyHooks: 'advisory',
+    },
     globalRoot = `.${name}/skills/gstack`,
     localSkillRoot = `.${name}/skills/gstack`,
     hostSubdir = `.${name}`,
@@ -98,14 +119,14 @@ export function defineHost<const N extends string>(overrides: HostOverrides<N>):
     },
     generation = {
       generateMetadata: false,
-      skipSkills: ['codex'],  // Codex skill is a Claude wrapper around codex exec
+      skipSkills: [],
     },
     pathRewrites,
     extraPathRewrites,
     toolRewrites,
     suppressedResolvers = [...GBRAIN_RESOLVERS],
     runtimeRoot = {
-      globalSymlinks: ['bin', 'browse/dist', 'browse/bin', 'gstack-upgrade', 'ETHOS.md'],
+      globalSymlinks: ['bin', 'lib', 'browse/dist', 'browse/bin', 'design/dist', 'make-pdf/dist', 'gstack-upgrade', 'ETHOS.md'],
       globalFiles: {
         'review': ['checklist.md', 'TODOS-format.md'],
       },
@@ -142,6 +163,8 @@ export function defineHost<const N extends string>(overrides: HostOverrides<N>):
     cliCommand,
     cliAliases,
     defaultModel,
+    tier,
+    capabilities,
     globalRoot,
     localSkillRoot,
     hostSubdir,

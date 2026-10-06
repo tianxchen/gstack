@@ -10,7 +10,8 @@
  * loop both defeat the regex, so it reported `read: []` even when the agent did the
  * work. It now runs the skill through `claude -p` (the SDK path the AUQ matrix
  * uses) and detects section reads from the tool-use stream (`Read` calls whose
- * file_path contains `sections/review-sections.md`). No rendering layer to mangle.
+ * file_path contains `sections/review-sections.md`, or Bash prints whose output
+ * contains every line of that section). No rendering layer to mangle.
  *
  * Hermetic, not install-mutating: the freshly-generated worktree skeleton +
  * sections are copied into a throwaway fixture dir and the absolute path is pinned,
@@ -18,42 +19,34 @@
  * ~/.claude install. (Install-layout linking is covered separately by
  * setup-sections-linking.test.ts.)
  *
- * The agent is told AskUserQuestion is unavailable, so it auto-picks the
- * recommended option through Step 0 and reaches the post-Step-0 STOP-Read. HOLD
+ * The agent is told AskUserQuestion is unavailable, so its bounded author
+ * policy resolves in-scope choices through Step 0 and the STOP-Read. HOLD
  * SCOPE is the simplest mode that still requires the full review section. Cost:
  * ~$1-2/run. Periodic tier.
  */
 
-import { test, expect } from 'bun:test';
+import { afterAll, test, expect } from 'bun:test';
 import { CAPTURE_LONG_MS } from './helpers/eval-budgets';
 import { describeE2ETier } from './helpers/e2e-gate';
 import {
   setupSkillDir,
   skillFromWorktree,
   captureSectionReads,
+  validateCeoReviewCompletion,
+  hasDisabledOutsideReview,
+  LONG_SECTION_CAPTURE_MS,
 } from './helpers/auq-sdk-capture';
+import { CEO_SECTION_CACHE_PLAN, CEO_SECTION_DECISION_POLICY, hasStaleFillRaceFinding } from './helpers/ceo-section-loading-fixture';
+import { hasApprovedStaleFillDecision } from './helpers/ceo-stale-fill-decision';
+import { createEvalCollector, finalizeEvalCollector, recordE2E } from './helpers/e2e-helpers';
 
 const describeE2E = describeE2ETier('periodic');
 const runId = `plan-ceo-section-loading-${process.env.EVALS_RUN_ID ?? 'local'}`;
+const collector = createEvalCollector('e2e-plan-ceo-section-loading');
+afterAll(async () => { await finalizeEvalCollector(collector); });
 
 // Sections every plan-ceo-review run must consult after Step 0.
 const REQUIRED_SECTIONS = ['review-sections.md'];
-
-const PLAN_MD = [
-  '# Plan: add an in-memory cache layer',
-  '',
-  '## Context',
-  'Reads hit the DB on every request. Add a process-local LRU cache in front of',
-  'the read path to cut DB load.',
-  '',
-  '## Approach',
-  '- Wrap the read repository in a cache that stores the last 1000 keys.',
-  '- Invalidate on write.',
-  '',
-  '## Out of scope',
-  'Distributed cache, cross-process coherence.',
-  '',
-].join('\n');
 
 describeE2E('/plan-ceo-review section-loading E2E (periodic, SDK capture)', () => {
   test(
@@ -64,30 +57,63 @@ describeE2E('/plan-ceo-review section-loading E2E (periodic, SDK capture)', () =
         skillName: 'plan-ceo-review',
         skillMd,
         sectionsFrom,
-        fixtures: { 'PLAN.md': PLAN_MD },
+        fixtures: { 'PLAN.md': CEO_SECTION_CACHE_PLAN },
         tmpPrefix: 'gstack-ceo-secload-',
       });
 
-      const { readSections, reportProduced, output } = await captureSectionReads({
+      const capture = await captureSectionReads({
         planDir,
         skillName: 'plan-ceo-review',
         scenario:
-          'Review the plan in PLAN.md. Hold the current scope (HOLD SCOPE mode) — do not challenge or expand scope. Run the full CEO review and produce the review report.',
+          'Review the plan in PLAN.md. Hold the current scope (HOLD SCOPE mode) — do not challenge or expand scope. Run the full CEO review. Treat the explicitly accepted repository, adapter and controller contracts as fixture facts; an unavailable implementation is not evidence that those contracts fail. Propose remedies for demonstrated gaps, and surface any actual contradiction without silently weakening a retained requirement. PLAN.md is both the active plan and final output: preserve and amend its plan content, then include the full review report there.',
+        decisionPolicy: CEO_SECTION_DECISION_POLICY,
+        // The skill appends its report to the active plan. Use that same
+        // artifact so the capture does not request a second report write.
+        reportFile: 'PLAN.md',
         requiredSections: REQUIRED_SECTIONS,
-        reportMarker: /GSTACK REVIEW REPORT|COMPLETION SUMMARY|review/i,
+        reportMarker: /^## GSTACK REVIEW REPORT\s*$/m,
         testName: 'plan-ceo-section-loading',
         runId,
+        // This external carve missed the generic loader's v1.71 budget fix:
+        // a full 11-section review needs its long work budget, not the helper's
+        // ordinary 300s default. The outer CAPTURE_LONG_MS remains unchanged.
+        timeout: LONG_SECTION_CAPTURE_MS,
+        // This case measures native section loading and report completion;
+        // outside-provider dispatch is covered by the cross-harness evals.
+        nativeReviewOnly: true,
       });
 
-      const missing = REQUIRED_SECTIONS.filter(s => !readSections.has(s));
-      expect({ reportProduced, read: [...readSections], missing }).toEqual({
-        reportProduced: true,
-        read: expect.any(Array),
-        missing: [],
-      });
-      // Guard against an empty pass: the report must have real content.
-      expect(output.trim().length).toBeGreaterThan(200);
+      try { assertSectionLoadingReport(capture); }
+      catch (error) {
+        recordE2E(collector, 'plan-ceo-section-loading', 'plan-ceo-section-loading', capture.result,
+          { passed: false, error: String(error), output: capture.output });
+        throw error;
+      }
+      recordE2E(collector, 'plan-ceo-section-loading', 'plan-ceo-section-loading', capture.result,
+        { passed: true, output: capture.output });
     },
     CAPTURE_LONG_MS,
   );
 });
+
+function assertSectionLoadingReport(capture: Awaited<ReturnType<typeof captureSectionReads>>): void {
+  validateCeoReviewCompletion(capture);
+  const { readSections, reportProduced, output } = capture;
+  const missing = REQUIRED_SECTIONS.filter(s => !readSections.has(s));
+  expect({ reportProduced, read: [...readSections], missing }).toEqual({
+    reportProduced: true,
+    read: expect.any(Array),
+    missing: [],
+  });
+  // Guard against an empty pass: the report must have real content.
+  expect(output.trim().length).toBeGreaterThan(200);
+  expect(output).toMatch(/^\|\s*Review\s*\|\s*Trigger\s*\|\s*Why\s*\|\s*Runs\s*\|\s*Status\s*\|\s*Findings\s*\|/m);
+  expect(output).toMatch(/^\|\s*CEO Review\s*\|/m);
+  // A native capture must not invent an outside dispatch or claim coverage.
+  expect(hasDisabledOutsideReview(output)).toBe(true);
+  // Loading a section and producing a table alone must not hide an empty
+  // review: the complete fixture still contains a real ordering defect. The
+  // skill's own ledger and currentDecision records are the primary witness;
+  // a report that left its ledger row stale may still assert the finding.
+  expect(hasApprovedStaleFillDecision(output) || hasStaleFillRaceFinding(output)).toBe(true);
+}

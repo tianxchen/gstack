@@ -59,7 +59,7 @@ export function generateGBrainContextLoad(ctx: TemplateContext): string {
 
 Extract 2-4 keywords from the user's request. Search the brain:
 \`gbrain search "<keywords>"\`. Read the top 3 results with
-\`gbrain get_page "<slug>"\`. Use that context to inform your analysis.
+\`gbrain get "<slug>"\`. Use that context to inform your analysis.
 
 If \`gbrain search\` returns no results or any non-zero exit, proceed
 without brain context. Full search/read protocol + examples:
@@ -110,7 +110,8 @@ EOF
 )"
 \`\`\`
 
-Then extract person/org entities and create stub pages for each one.
+Read the saved page back before claiming persistence. Then extract
+person/org entities and create stub pages for each one.
 Throttle errors (exit 1 with "throttle"/"rate limit"/"busy") and any
 other non-zero exit are transient — don't retry inline. Full entity-stub
 template, throttle handling, and backlink protocol:
@@ -153,17 +154,32 @@ export function generateBrainPreflight(ctx: TemplateContext): string {
     const projectFlag = entity.scope === 'per-project' ? '--project "$SLUG"' : '';
     return `  printf '\\n### %s\\n\\n' "${entityName}"\n  ${binDir}/gstack-brain-cache get ${entityName} ${projectFlag} 2>/dev/null || printf '_(no ${entityName} digest available yet)_\\n'`;
   }).join('\n');
+  const usageByEntity: Record<string, string> = {
+    product: 'If `product` digest names the value prop, target user, or stage, do not re-ask.',
+    goals: 'If `goals` digest lists active goals, frame recommendations against them.',
+    'recent-decisions': 'If `recent-decisions` digest names a prior scope/architecture choice, flag if this plan contradicts.',
+    'user-profile': 'If `user-profile` digest carries calibration pattern statements ("tends to over-engineer security"), surface them when relevant.',
+    'developer-persona': 'If `developer-persona` digest describes the builder workflow or friction tolerance, adapt the DX recommendations.',
+    brand: 'If `brand` digest names visual principles or constraints, use them before asking about design taste.',
+    'competitive-intel': 'If `competitive-intel` digest names peer products or workflow expectations, use them as comparison context.',
+    salience: 'If `salience` digest surfaces recent local context, treat it as a pointer to verify rather than a standalone fact.',
+  };
+  const usageLines = subset
+    .map((entityName) => usageByEntity[entityName])
+    .filter(Boolean)
+    .map((line) => `- ${line}`)
+    .join('\n');
 
   return `## Brain Context (preflight)
 
-Before asking any clarifying questions, load the brain's structured context
+${ctx.skillName === 'plan-eng-review' ? 'After the Scope gate, before later review questions, load the brain\'s structured context' : 'Before asking any clarifying questions, load the brain\'s structured context'}
 for this project. The cache layer handles staleness, refresh, and stale-but-
 usable fallback automatically. Skip questions whose answers are already
 present in the loaded context; ground recommendations in what the brain
-already knows about the user, the product, the goals, and recent decisions.
+prints for this skill.
 
 \`\`\`bash
-eval "$(${binDir}/gstack-slug 2>/dev/null)" 2>/dev/null || true
+SLUG=$(${binDir}/gstack-slug --get SLUG 2>/dev/null) || true
 {
   printf '## Brain Context\\n\\n'
 ${loadLines}
@@ -173,10 +189,7 @@ rm -f /tmp/.gstack-brain-context-$$.md 2>/dev/null || true
 \`\`\`
 
 **How to use this context:**
-- If \`product\` digest names the value prop, target user, or stage — don't re-ask.
-- If \`goals\` digest lists active goals — frame recommendations against them.
-- If \`recent-decisions\` digest names a prior scope/architecture choice — flag if this plan contradicts.
-- If \`user-profile\` digest carries calibration pattern statements ("tends to over-engineer security") — surface them when relevant.
+${usageLines}
 - If a digest is \`(no X digest available yet)\`, treat that section as cold; ask the user.
 
 **Privacy:** Salience digest is filtered by allowlist (D9 default: \`projects/\`,
@@ -197,13 +210,15 @@ export function generateBrainCacheRefresh(ctx: TemplateContext): string {
   const binDir = ctx.paths.binDir;
   return `## Brain Cache Background Refresh
 
-After the skill's work completes (and telemetry has logged), kick a
+${ctx.skillName === 'plan-ceo-review' ? `After the exit gate passes, start this nonblocking refresh before telemetry.
+Then return to the finalization instructions below; the user need not wait for
+the refresh process.` : `After the skill's work completes (and telemetry has logged), kick a
 background refresh of any cache digest that's getting close to its TTL.
 This is non-blocking — the user doesn't wait. Next invocation benefits
-from the warm cache.
+from the warm cache.`}
 
 \`\`\`bash
-eval "$(${binDir}/gstack-slug 2>/dev/null)" 2>/dev/null || true
+SLUG=$(${binDir}/gstack-slug --get SLUG 2>/dev/null) || true
 (${binDir}/gstack-brain-cache refresh --project "$SLUG" 2>/dev/null &) || true
 \`\`\`
 `;
@@ -230,25 +245,15 @@ export function generateBrainWriteBack(ctx: TemplateContext): string {
     .map((e) => `  ${ctx.paths.binDir}/gstack-brain-cache invalidate ${e} --project "$SLUG" 2>/dev/null || true`)
     .join('\n');
 
-  return `## Brain Calibration Write-Back (Phase 2 / gated)
+  return `## Brain Calibration Write-Back (gated)
 
-When the skill makes a typed prediction worth tracking (scope decision,
-TTHW target, architectural bet, wedge commitment), it MAY write a
-\`kind=bet\` take to the brain so a calibration profile builds over time.
+${ctx.skillName === 'plan-eng-review' ? '`BRAIN_CALIBRATION_WRITEBACK` is a reserved default-off gate; this runtime does not set it. Skip this section and continue the finish sequence. Do not enable it or infer permission from brain availability. The contract below is retained for future gated integration, not an instruction to write now.\n\n' : ''}Skip unless \`BRAIN_CALIBRATION_WRITEBACK\` is set and the preamble/brain-health
+output or gstack config shows \`brain_trust_policy@<endpoint-hash>=personal\`.
+If unknown, skip. If both gates pass, record one durable
+typed prediction with \`mcp__gbrain__takes_add\`; if unavailable, use
+\`mcp__gbrain__put_page\` with a gstack:takes fence block.
 
-**Gated on two things:**
-1. Brain trust policy for the active endpoint is \`personal\` (check via
-   \`${ctx.paths.binDir}/gstack-config get brain_trust_policy@<endpoint-hash>\`).
-   Shared brains skip write-back to avoid polluting team calibration.
-2. Feature flag \`BRAIN_CALIBRATION_WRITEBACK\` is set (today: false; flips
-   to true when upstream gbrain v0.42+ ships \`takes_add\` MCP op).
-
-When both gates pass, the write-back path uses \`mcp__gbrain__takes_add\`
-to record a take with weight ${weight} (per SKILL_CALIBRATION_WEIGHTS).
-If the MCP op is unavailable, fall back to \`mcp__gbrain__put_page\` with
-a gstack:takes fence block (documented but uglier path).
-
-Mandatory take frontmatter shape:
+Take frontmatter:
 \`\`\`yaml
 kind: bet
 holder: <user identity from whoami>
@@ -259,12 +264,10 @@ expected_resolution: <date in 1-3 months depending on skill>
 source_skill: ${ctx.skillName}
 \`\`\`
 
-After write, invalidate the affected digests so the next preflight reflects
-the new state:
+After write, invalidate affected digests:
 
 \`\`\`bash
-eval "$(${ctx.paths.binDir}/gstack-slug 2>/dev/null)" 2>/dev/null || true
+SLUG=$(${ctx.paths.binDir}/gstack-slug --get SLUG 2>/dev/null) || true
 ${invalidateBash || '  # (no per-skill invalidation targets configured)'}
-\`\`\`
-`;
+\`\`\``;
 }

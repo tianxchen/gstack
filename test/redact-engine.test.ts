@@ -234,6 +234,50 @@ describe("MEDIUM demoted credential-shaped patterns (TENSION-1)", () => {
     expect(ids(`authToken: ${v}`)).toContain("env.kv"); // (iv) credential camel
     expect(ids(`clientSecret: ${v}`)).toContain("env.kv"); // (iv) credential camel
   });
+  test("env.kv ignores TypeScript parameter types without hiding credential values", () => {
+    const signature = `export async function issueServerCoachItem(
+  db: Pool,
+  session: SessionState,
+  item: IssuedCoachItem,
+): Promise<void> {}`;
+    const value = "8Fk2pQ9vXz4wL7mN3rT6yB1cD5eG0hJ";
+    expect(ids(signature)).not.toContain("env.kv");
+    expect(ids(`session: ${value},`)).toContain("env.kv");
+    expect(ids(`session: "${value}",`)).toContain("env.kv");
+  });
+  test("env.kv ignores dynamic JSX attributes without hiding literal values", () => {
+    const value = "8Fk2pQ9vXz4wL7mN3rT6yB1cD5eG0hJ";
+    expect(ids("key={turn.requestId + turn.role + index}")).not.toContain("env.kv");
+    expect(ids("apiKey={settings.apiKey}")).not.toContain("env.kv");
+    expect(ids(`key={${value}}`)).toContain("env.kv");
+    expect(ids(`API_KEY={${value}}`)).toContain("env.kv");
+    expect(ids(`key={settings.apiKey + "${value}"}`)).toContain("env.kv");
+    expect(ids(`key="${value}"`)).toContain("env.kv");
+  });
+  // #2912 — a line that READS a secret from the environment holds no secret;
+  // it must not fire (and so must not be masked or withhold a /cso source file).
+  test("env.kv skips exact environment reads (#2912)", () => {
+    for (const line of [
+      'api_key=os.environ["AGENTOPS_API_KEY"]',
+      '        api_key=os.environ["AGENTOPS_API_KEY"]',
+      "LIVEKIT_API_KEY = os.getenv('LIVEKIT_API_KEY')",
+      'token = os.environ.get("GH_TOKEN")',
+      "API_KEY=process.env.OPENAI_API_KEY",
+      "SECRET_KEY=getenv(\"APP_SECRET_KEY\")",
+    ]) {
+      expect(ids(line)).not.toContain("env.kv");
+      expect(redactFindingSpans(`x=1\n${line}\n`, {})).toBe(`x=1\n${line}\n`);
+    }
+  });
+  test("env.kv still fires on real high-entropy keys beside or instead of an env read (#2912 negative controls)", () => {
+    const v = "Zq8vR2mN5tYb7Lc3Wd9K";
+    expect(ids(`SECRET_KEY = os.getenv('DJANGO_SECRET', '${v}')`)).toContain("env.kv");
+    expect(ids(`API_KEY=process.env.OPENAI_API_KEY||"${v}"`)).toContain("env.kv");
+    expect(ids(`API_KEY=os.environ["X"]+"${v}"`)).toContain("env.kv");
+    expect(ids(`API_KEY=os.environ_${v}`)).toContain("env.kv");
+    expect(ids(`API_KEY=getenv${v}`)).toContain("env.kv");
+    expect(ids(`API_KEY="${v}"`)).toContain("env.kv");
+  });
   test("env.kv stays MEDIUM (calibration: generic net, not a blocker)", () => {
     const f = scan("api_key=8Fk2pQ9vXz4wL7mN3rT6yB1cD5eG0hJ", { repoVisibility: "private" })
       .findings.find((x) => x.id === "env.kv");
@@ -573,20 +617,10 @@ describe("redactFindingSpans — machine-egress masking (#1947)", () => {
     expect(out).toBe("first <REDACTED-aws.access_key> then <REDACTED-github.pat> end");
   });
 
-  test("fails closed (null) when a span cannot be relocated — never raw passthrough", () => {
-    // env.kv's span (the value) starts well past the regex match start (the
-    // var name), so locateSpan's rewind-2 re-exec misses it. The contract is
-    // null → caller drops the whole payload. The one thing that must never
-    // happen is the secret surviving in the output.
+  test("masks an anchored env.kv value rather than withholding the whole payload", () => {
     const secret = "8Fk2pQ9vXz4wL7mN3rT6yB1cD5eG0hJq";
     const out = redactFindingSpans(`API_KEY=${secret}`, { repoVisibility: "private" });
-    if (out !== null) {
-      // If locateSpan ever learns to find context-prefixed spans, masking
-      // must actually mask.
-      expect(out).not.toContain(secret);
-    } else {
-      expect(out).toBeNull();
-    }
+    expect(out).toBe("API_KEY=<REDACTED-env.kv>");
   });
 
   test("line/col at boundaries: line start, after blank lines, first char, last unterminated line", () => {
@@ -603,7 +637,7 @@ describe("redactFindingSpans — machine-egress masking (#1947)", () => {
     expect(redactFindingSpans(`a\nb\n${token} x`, { repoVisibility: "private" })).toBe("a\nb\n<REDACTED-github.pat> x");
   });
 
-  test("multiline input redacts a finding past the first line (locateSpan line/col path)", () => {
+  test("multiline input redacts a finding past the first line (original span map)", () => {
     const token = "ghp_" + "1234567890abcdefghijklmnopqrstuvwxyz";
     const out = redactFindingSpans(`line one\nline two has ${token}\nline three`, {
       repoVisibility: "private",

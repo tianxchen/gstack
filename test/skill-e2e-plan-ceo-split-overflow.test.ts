@@ -1,5 +1,5 @@
 /**
- * /plan-ceo-review split-overflow regression (periodic, paid, real-PTY).
+ * /plan-ceo-review split-overflow regression (marathon, paid, real-PTY).
  *
  * Catches the original failure mode the user complained about: when the
  * agent has 5+ options for ONE conceptual decision, it must split into N
@@ -13,11 +13,12 @@
  *
  * The fixture seeds 5 independent scope candidates (chat-platform
  * integrations) — each carries an independent include/defer/cut decision.
- * With the split rule active, the natural compliant shape is a per-option
- * chain at parent D<N>; the test asserts the agent fires at least
- * [N-1] review-phase AUQs (standard tolerance band from the existing
- * finding-count tests, which accounts for one expected scope-reduction
- * call before the per-option chain begins).
+ * The existing semantic scope validator examines every acknowledged native
+ * call, including candidate choices before mode selection. It requires
+ * independent offered dispositions for all five candidates; the call floor
+ * is two, the minimum for five options at four per call. The review-phase counter reports progress, not target coverage.
+ * Collection ends once all five native choices are acknowledged; the same
+ * semantic validator then decides whether those choices satisfy the metric.
  *
  * Why a separate test from skill-e2e-plan-ceo-finding-count and
  * skill-e2e-plan-eng-multi-finding-batching:
@@ -28,8 +29,11 @@
  *     which is exactly the shape that hits Conductor's 4-option cap and
  *     triggers the new split-vs-drop guidance.
  *
- * Tier: periodic (~25 min, ~$0.30-$5.00/run depending on agent path).
- * Sequential by default.
+ * The fixture supplies the HOLD SCOPE mode the actor always chose, so 0E skips
+ * its mode question. Run 36385945043 acknowledged all five candidates 8m55s
+ * after launch (mode question included); collection stops there.
+ *
+ * Tier: periodic (25 min budget; ~8-9 min expected). Sequential by default.
  */
 
 import { test } from 'bun:test';
@@ -42,21 +46,25 @@ import {
   ceoStep0Boundary,
 } from './helpers/claude-pty-runner';
 import { FORCING_SPLIT_OVERFLOW_CEO } from './fixtures/forcing-finding-seeds';
+import { CEO_SPLIT_CALL_FLOOR, ceoSplitDecisionFingerprints, isCeoSplitCandidateCall, isCeoSplitCollectionComplete, pickCeoSplitCountQuestion } from './helpers/ceo-split-question-policy';
+import { CEO_SCOPE_CANDIDATES } from './helpers/plan-review-cases';
+import { evaluatePlanReviewDecisions } from './helpers/plan-review-decisions';
 
-const describeE2E = describeE2ETier('periodic');
+const describeE2E = describeE2ETier('marathon');
 
 const N = 5;
-const FLOOR = N - 1; // 4 — must fire at least one AUQ per non-dropped option
+const FLOOR = CEO_SPLIT_CALL_FLOOR;
 
 /** Plan-file target baked into the FORCING_SPLIT_OVERFLOW_CEO fixture prompt.
  *  Rewritten per-run to a mkdtemp path so concurrent runs (--retry,
  *  EVALS_JOBS>1, sibling worktrees) never share one /tmp artifact. */
 const FIXTURE_PLAN_PATH = '/tmp/gstack-test-plan-ceo-split-overflow.md';
 
-describeE2E('/plan-ceo-review split-overflow regression (periodic)', () => {
+describeE2E('/plan-ceo-review split-overflow regression (marathon)', () => {
   test(
     `5-option scope decision emits >= ${FLOOR} review-phase AskUserQuestions (no dropping)`,
     async () => {
+      const deadlineAt = Date.now() + 1_500_000;
       const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-e2e-plan-ceo-split-overflow-'));
       const planPath = path.join(tmpDir, 'gstack-test-plan-ceo-split-overflow.md');
       const followUpPrompt = FORCING_SPLIT_OVERFLOW_CEO.replaceAll(FIXTURE_PLAN_PATH, planPath);
@@ -71,40 +79,34 @@ describeE2E('/plan-ceo-review split-overflow regression (periodic)', () => {
           skillName: 'plan-ceo-review',
           slashCommand: '/plan-ceo-review',
           followUpPrompt,
+          permissionPlanPath: planPath,
           isLastStep0AUQ: ceoStep0Boundary,
+          // Candidate choices can occur before mode selection. Only those
+          // acknowledged menus satisfy the split metric; expansions do not.
+          isReviewAUQ: isCeoSplitCandidateCall,
+          isCollectionComplete: isCeoSplitCollectionComplete,
+          pickAUQ: pickCeoSplitCountQuestion,
+          observeSetupQuestions: true,
           reviewCountCeiling: N + 3, // hard cap above floor + tolerance
-          // LIVE-REPO CWD: PTY session needs the repo cwd — gstack skill
-          // registry + hermetic pre-trusted dir (hermetic-env trustedDirs).
-          cwd: process.cwd(),
-          timeoutMs: 1_500_000, // 25 min
+          // The actor is configured for review; setup preferences are not scope choices.
+          preconfiguredReviewActor: true,
+          timeoutMs: deadlineAt - Date.now(), // One 25-minute budget, including final validation.
           env: { QUESTION_TUNING: 'false', EXPLAIN_LEVEL: 'default' },
         });
 
-        if (!['plan_ready', 'completion_summary', 'ceiling_reached'].includes(obs.outcome)) {
+        if (!['plan_ready', 'completion_summary', 'collection_complete', 'ceiling_reached'].includes(obs.outcome)) {
           throw new Error(
             `split-overflow test FAILED: outcome=${obs.outcome}\n` +
               `step0=${obs.step0Count} review=${obs.reviewCount} elapsed=${obs.elapsedMs}ms\n` +
               `--- evidence (last 3KB) ---\n${obs.evidence}`,
           );
         }
-        if (obs.reviewCount < FLOOR) {
-          throw new Error(
-            `SPLIT-OVERFLOW REGRESSION: reviewCount=${obs.reviewCount} < FLOOR=${FLOOR}.\n` +
-              `Agent surfaced fewer review-phase AUQs than independent scope options.\n` +
-              `This is the original drop-to-fit-4-options failure mode:\n` +
-              `  expected: ${N} per-option calls (or compliant ≤4-group batching with follow-up)\n` +
-              `  got:      ${obs.reviewCount} call(s)\n` +
-              `Most likely the agent dropped one option to fit Conductor's 4-option\n` +
-              `cap, the exact bug scripts/resolvers/preamble/generate-ask-user-format.ts\n` +
-              `"Handling 5+ options — split, never drop" exists to prevent.\n` +
-              `Review-phase fingerprints:\n` +
-              obs.fingerprints
-                .filter((f) => !f.preReview)
-                .map((f) => `  - "${f.promptSnippet.slice(0, 80)}"`)
-                .join('\n') +
-              `\n--- evidence (last 3KB) ---\n${obs.evidence}`,
-          );
-        }
+        // The phase counter is progress, not target coverage. The scope validator
+        // requires all five independent candidate decisions, complete native
+        // evidence, and offered Include/Defer/Cut ACKs; FLOOR only bounds calls.
+        await evaluatePlanReviewDecisions({ plan: followUpPrompt, targets: CEO_SCOPE_CANDIDATES,
+          fingerprints: ceoSplitDecisionFingerprints(obs.transcript, obs.fingerprints),
+          floor: FLOOR, kind: 'scope', deadlineAt });
       } finally {
         try {
           fs.rmSync(tmpDir, { recursive: true, force: true });

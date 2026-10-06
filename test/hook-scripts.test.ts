@@ -3,9 +3,11 @@ import { spawnSync } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
+import { usePrivateStateRoot } from './helpers/private-state-root';
 import { gitArgvIn } from './helpers/scratch-repo';
 
 const ROOT = path.resolve(import.meta.dir, '..');
+usePrivateStateRoot();
 const CAREFUL_SCRIPT = path.join(ROOT, 'careful', 'bin', 'check-careful.sh');
 const FREEZE_SCRIPT = path.join(ROOT, 'freeze', 'bin', 'check-freeze.sh');
 
@@ -285,6 +287,23 @@ describe('check-careful.sh', () => {
       expect(output.hookSpecificOutput?.permissionDecision).toBe('ask');
       expect(output.hookSpecificOutput?.permissionDecisionReason).toContain('recursive delete');
     });
+  });
+
+  test.each([
+    ['rm -rf node_modules\nrm -rf /', 'recursive delete'],
+    ['rm${IFS}-rf${IFS}/', 'obfuscation'],
+    ['psql -c "DROP DATABASE production"', 'SQL DROP'],
+    ['psql -c "TRUNCATE users"', 'SQL TRUNCATE'],
+    ['git push --force origin feature', 'force-push'],
+    ['git reset --hard', 'reset --hard'],
+    ['git restore .', 'uncommitted changes'],
+    ['kubectl delete pod app', 'kubectl delete'],
+    ['docker system prune', 'Docker'],
+  ])('keeps %s visible before large multiline content', (command, reason) => {
+    const { exitCode, output } = runHook(CAREFUL_SCRIPT, carefulInput(`${command}\n# ${'x'.repeat(100_000)}`));
+    expect(exitCode).toBe(0);
+    expect(output.hookSpecificOutput?.permissionDecision).toBe('ask');
+    expect(output.hookSpecificOutput?.permissionDecisionReason).toContain(reason);
   });
 
   // --- Shell obfuscation ---
@@ -681,6 +700,16 @@ describe('check-careful.sh', () => {
       });
     });
 
+    test('a project pattern matches before large multiline content', () => {
+      withPatternFile('terraform\\s+destroy\n', (gstackHome) => {
+        const { exitCode, output } = runHook(CAREFUL_SCRIPT,
+          carefulInput(`terraform destroy\n# ${'x'.repeat(100_000)}`), { GSTACK_HOME: gstackHome });
+        expect(exitCode).toBe(0);
+        expect(output.hookSpecificOutput?.permissionDecision).toBe('ask');
+        expect(output.hookSpecificOutput?.permissionDecisionReason).toContain('Project rule');
+      });
+    });
+
     test('a garbage pattern file cannot suppress a baseline match (additive invariant)', () => {
       withPatternFile('# override: allow everything\nallow-everything\nignore baseline\n', (gstackHome) => {
         const { exitCode, output } = runHook(CAREFUL_SCRIPT, carefulInput('rm -rf /var/data'), { GSTACK_HOME: gstackHome });
@@ -1055,11 +1084,11 @@ describe('check-freeze.sh state-root resolution (#1459 / #1509)', () => {
 // ============================================================
 // gstack_hook_log_fire analytics sink follows the same state root (#1459)
 // ============================================================
-// The hook_fire record lands under ${GSTACK_HOME:-$HOME/.gstack}/analytics —
-// the SAME two-step chain every other analytics writer and reader uses
-// (gstack-skill-start, gstack-retro-metrics, gstack-analytics) — deliberately
-// NOT the plugin-aware state root the freeze FILE uses, so the usage log stays
-// one file. Logging is best-effort: an unwritable sink never changes the decision.
+// The hook_fire record lands under the resolved state root (bin/gstack-state-root.sh)
+// — the SAME root the freeze FILE and every other analytics writer and reader
+// (gstack-skill-start, gstack-retro-metrics, gstack-analytics) use, so the usage
+// log stays one file. Logging is best-effort: an unwritable sink never changes
+// the decision.
 describe('gstack_hook_log_fire writes under the resolved state root', () => {
   const BOUNDARY = '/Users/dev/project/src/';
   const OUTSIDE = '/Users/dev/other-project/index.ts';
@@ -1087,16 +1116,16 @@ describe('gstack_hook_log_fire writes under the resolved state root', () => {
     });
   });
 
-  test('plugin install: the freeze FILE is read from CLAUDE_PLUGIN_DATA but hook_fire still lands under $HOME/.gstack/analytics (one usage log)', () => {
+  test('plugin install: the freeze FILE and hook_fire both use CLAUDE_PLUGIN_DATA (one state root, one usage log)', () => {
     withFreezeDir(BOUNDARY, (pluginData) => {
       withEmptyDir((fakeHome) => {
         const { output } = runHook(FREEZE_SCRIPT, freezeInput(OUTSIDE),
           freezeEnv(pluginData, { HOME: fakeHome, CLAUDE_PLUGIN_ROOT: '/Plugins/GSTACK' }));
         expect(output.hookSpecificOutput?.permissionDecision).toBe('deny');
-        const rec = lastRecord(path.join(fakeHome, '.gstack', 'analytics', 'skill-usage.jsonl'));
+        const rec = lastRecord(path.join(pluginData, 'analytics', 'skill-usage.jsonl'));
         expect(rec.event).toBe('hook_fire');
         expect(rec.skill).toBe('freeze');
-        expect(fs.existsSync(path.join(pluginData, 'analytics'))).toBe(false);
+        expect(fs.existsSync(path.join(fakeHome, '.gstack', 'analytics'))).toBe(false);
       });
     });
   });
@@ -1120,8 +1149,8 @@ describe('gstack_hook_log_fire writes under the resolved state root', () => {
     const base = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-freeze-backstop-'));
     const fakeBin = path.join(base, 'bin');
     fs.mkdirSync(fakeBin);
-    fs.writeFileSync(path.join(fakeBin, 'head'), '#!/bin/sh\nexit 1\n');
-    fs.chmodSync(path.join(fakeBin, 'head'), 0o755);
+    fs.writeFileSync(path.join(fakeBin, 'sed'), '#!/bin/sh\nexit 1\n');
+    fs.chmodSync(path.join(fakeBin, 'sed'), 0o755);
     try {
       withFreezeDir(BOUNDARY, (stateDir) => {
         const { exitCode, output } = runHook(FREEZE_SCRIPT, freezeInput('/Users/dev/project/src/x.ts'),

@@ -1,6 +1,9 @@
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { CAPTURE_MS, CAPTURE_LONG_MS } from './helpers/eval-budgets';
 import { runSkillTest, type SkillTestResult } from './helpers/session-runner';
+import { OFFICE_HOURS_BUN_GRACE_MS, runRecordedOfficeHoursAttempt } from './helpers/office-hours-attempt';
+import { resolveEvalModel } from '../lib/eval-model';
+import { getProjectEvalDir } from './helpers/eval-store';
 import { callJudge } from './helpers/llm-judge';
 import {
   ROOT, runId, evalsEnabled, selectedTests,
@@ -10,7 +13,8 @@ import {
 } from './helpers/e2e-helpers';
 import { asideAvailable } from './helpers/aside-available';
 import { installFakeImpeccable, DETECT_SAMPLE } from './helpers/fake-impeccable';
-import { sliceBetween } from './helpers/skill-fixture';
+import { hermeticChildEnv } from './helpers/hermetic-env';
+import { sliceBetween, extractDesignResearchContract } from './helpers/skill-fixture';
 import { spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -201,10 +205,7 @@ Write DESIGN.md and CLAUDE.md (or update it) in the working directory.`,
     // Extract only the research contract (CLAUDE.md: extract, don't copy). The tree's
     // SKILL.md unless GSTACK_E2E_DOCS_ROOT points at a `gen:skill-docs --out-dir` render.
     const skill = fs.readFileSync(path.join(process.env.GSTACK_E2E_DOCS_ROOT || ROOT, 'design-consultation', 'SKILL.md'), 'utf-8');
-    const sectionStart = skill.indexOf('## Web research runs in Aside');
-    if (sectionStart < 0) throw new Error('design-consultation/SKILL.md has no "Web research runs in Aside" section — regenerate with: bun run gen:skill-docs');
-    const sectionEnd = skill.indexOf('\n## ', sectionStart + 1);
-    fs.writeFileSync(path.join(researchDir, 'research-contract.md'), skill.slice(sectionStart, sectionEnd > sectionStart ? sectionEnd : undefined));
+    fs.writeFileSync(path.join(researchDir, 'research-contract.md'), extractDesignResearchContract(skill));
     const live = asideAvailable();
 
     const result = await runSkillTest({
@@ -414,13 +415,25 @@ describeIfSelected('Plan Design Review E2E', ['plan-design-review-plan-mode', 'p
   }
 
   testConcurrentIfSelected('plan-design-review-plan-mode', async () => {
-    const reviewDir = setupReviewDir();
+    let reviewDir: string | undefined;
+    let planBefore = '';
+    const cleanup = () => {
+      if (reviewDir) try { fs.rmSync(reviewDir, { recursive: true, force: true }); } catch {}
+    };
     try {
-      const run = (cmd: string, args: string[]) =>
-        spawnSync(cmd, args, { cwd: reviewDir, stdio: 'pipe', timeout: 5000 });
+      await runRecordedOfficeHoursAttempt({
+        collector: evalCollector, name: '/plan-design-review plan-mode', suite: 'Plan Design Review E2E',
+        model: process.env.EVALS_MODEL ?? resolveEvalModel('capture'),
+        // Keep recording/cancellation grace inside the existing 600s Bun wall.
+        budgetMs: CAPTURE_LONG_MS - OFFICE_HOURS_BUN_GRACE_MS,
+        run: async signal => {
+          try {
+            reviewDir = setupReviewDir();
+            const run = (cmd: string, args: string[]) =>
+              spawnSync(cmd, args, { cwd: reviewDir, stdio: 'pipe', timeout: 5000 });
 
-      // Create a plan file with intentional design gaps
-      fs.writeFileSync(path.join(reviewDir, 'plan.md'), `# Plan: User Dashboard
+            // Preserve the original complete seed for byte-level edit evidence.
+            fs.writeFileSync(path.join(reviewDir, 'plan.md'), `# Plan: User Dashboard
 
 ## Context
 Build a user dashboard that shows account stats, recent activity, and settings.
@@ -438,59 +451,69 @@ Build a user dashboard that shows account stats, recent activity, and settings.
 - API endpoint: GET /api/dashboard
 - WebSocket for real-time activity updates
 `);
+            planBefore = fs.readFileSync(path.join(reviewDir, 'plan.md'), 'utf8');
+            run('git', ['add', '.']);
+            run('git', ['commit', '-m', 'initial plan']);
+            signal.throwIfAborted();
+            return await runSkillTest({
+              prompt: `Read plan-design-review/SKILL.md for the design review workflow.
 
-      run('git', ['add', '.']);
-      run('git', ['commit', '-m', 'initial plan']);
+Review the plan in ./plan.md. Its design gaps are vague "clean, modern UI" and "cards and icons", a "hero section with gradient" (AI slop), and missing empty, error, loading, responsive, and accessibility behavior.
 
-      const result = await runSkillTest({
-        prompt: `Read plan-design-review/SKILL.md for the design review workflow.
+Use this non-interactive delivery sequence:
+1. Skip the preamble bash block and any AskUserQuestion calls. Read every lazy section the workflow requires: in one response, natively Read plan-design-review/SKILL.md (Read the remainder with offset if the first Read stops early), plan-design-review/sections/review-sections.md (the one lazy section this review requires) and plan.md. No cat, sed, ls, manifest or git exploration is needed. Review all 7 design passes. Rate each scored design dimension 0-10 and explain what would make it a 10; preserve the unresolved-decisions pass and every required design decision.
+2. EDIT plan.md with the missing design decisions (interaction state table, empty states, responsive behavior, etc.) and the full required review report. Keep the saved review compact: use the canonical tables and decision IDs. Specify each design requirement once; refer to its section or decision ID from other pass rationales, tasks, and report cells instead of repeating that specification. Give concise score rationales and 10/10 explanations. Retain all required report fields, design decisions, diagrams, ratings, and explanations. Draft your plan.md additions, including the report, to about 10,000 characters; this is a drafting target, not a check, so do not count characters or trim after saving.
+3. Persist that complete plan and review with Write before publishing a completed walkthrough or saying a fix is applied. Read plan.md back to verify the saved changes.
+4. Then return a brief, concrete summary of the design changes in at most ten lines; do not repeat the full review in the response. This changes presentation only: execute every required pass and lazy-section Read.
 
-Review the plan in ./plan.md. This plan has several design gaps — it uses vague language like "clean, modern UI" and "cards and icons", mentions a "hero section with gradient" (AI slop), and doesn't specify empty states, error states, loading states, responsive behavior, or accessibility.
+IMPORTANT: Do NOT try to browse any URLs or use a browse binary. This is a plan review, not a live site audit.`,
+              workingDirectory: reviewDir,
+              maxTurns: 15,
+              timeout: CAPTURE_MS,
+              publicStreamDiagnostics: true,
+              signal,
+              testName: 'plan-design-review-plan-mode',
+              runId,
+            });
+          } catch (error) {
+            cleanup();
+            throw error;
+          }
+        },
+        validate: result => {
+          try {
+            logCost('/plan-design-review plan-mode', result);
 
-Skip the preamble bash block. Skip any AskUserQuestion calls — this is non-interactive. Rate each design dimension 0-10 and explain what would make it a 10. Then EDIT plan.md to add the missing design decisions (interaction state table, empty states, responsive behavior, etc.).
+            // Check that the agent produced design ratings (0-10 scale)
+            const output = result.output || '';
+            const hasRatings = /\d+\/10/.test(output);
 
-IMPORTANT: Do NOT try to browse any URLs or use a browse binary. This is a plan review, not a live site audit. Just read the plan file, review it, and edit it to fix the gaps.`,
-        workingDirectory: reviewDir,
-        maxTurns: 15,
-        timeout: CAPTURE_MS,
-        testName: 'plan-design-review-plan-mode',
-        runId,
+            // Check that the plan file was edited (the core new behavior)
+            const planAfter = fs.readFileSync(path.join(reviewDir, 'plan.md'), 'utf-8');
+            // A rated summary may leave the design terms to the plan it wrote
+            // (census 37179171083); a plan term counts only when the review added it.
+            const count = (text: string, term: string) => text.toLowerCase().split(term).length - 1;
+            const hasDesignContent = ['information architecture', 'interaction state', 'ai slop', 'hierarchy'].some(term =>
+              output.toLowerCase().includes(term) || (hasRatings && count(planAfter, term) > count(planBefore, term)));
+            const planWasEdited = planAfter !== planBefore && planAfter.length > 300;
+            const planHasDesignAdditions = planAfter.toLowerCase().includes('empty') ||
+              planAfter.toLowerCase().includes('loading') ||
+              planAfter.toLowerCase().includes('error') ||
+              planAfter.toLowerCase().includes('state') ||
+              planAfter.toLowerCase().includes('responsive') ||
+              planAfter.toLowerCase().includes('accessibility');
+
+            expect(['success', 'error_max_turns']).toContain(result.exitReason);
+            // Agent should produce design-relevant output about the plan
+            expect(hasDesignContent).toBe(true);
+            // Agent should have edited the plan file to add missing design decisions
+            expect(planWasEdited).toBe(true);
+            expect(planHasDesignAdditions).toBe(true);
+
+          } finally { cleanup(); }
+        },
       });
-
-      logCost('/plan-design-review plan-mode', result);
-
-      // Check that the agent produced design ratings (0-10 scale)
-      const output = result.output || '';
-      const hasRatings = /\d+\/10/.test(output);
-      const hasDesignContent = output.toLowerCase().includes('information architecture') ||
-        output.toLowerCase().includes('interaction state') ||
-        output.toLowerCase().includes('ai slop') ||
-        output.toLowerCase().includes('hierarchy');
-
-      // Check that the plan file was edited (the core new behavior)
-      const planAfter = fs.readFileSync(path.join(reviewDir, 'plan.md'), 'utf-8');
-      const planOriginal = `# Plan: User Dashboard`;
-      const planWasEdited = planAfter.length > 300; // Original is ~450 chars, edited should be much longer
-      const planHasDesignAdditions = planAfter.toLowerCase().includes('empty') ||
-        planAfter.toLowerCase().includes('loading') ||
-        planAfter.toLowerCase().includes('error') ||
-        planAfter.toLowerCase().includes('state') ||
-        planAfter.toLowerCase().includes('responsive') ||
-        planAfter.toLowerCase().includes('accessibility');
-
-      recordE2E(evalCollector, '/plan-design-review plan-mode', 'Plan Design Review E2E', result, {
-        passed: hasDesignContent && planWasEdited && ['success', 'error_max_turns'].includes(result.exitReason),
-      });
-
-      expect(['success', 'error_max_turns']).toContain(result.exitReason);
-      // Agent should produce design-relevant output about the plan
-      expect(hasDesignContent).toBe(true);
-      // Agent should have edited the plan file to add missing design decisions
-      expect(planWasEdited).toBe(true);
-      expect(planHasDesignAdditions).toBe(true);
-    } finally {
-      try { fs.rmSync(reviewDir, { recursive: true, force: true }); } catch {}
-    }
+    } finally { cleanup(); }
   }, CAPTURE_LONG_MS);
 
   testConcurrentIfSelected('plan-design-review-no-ui-scope', async () => {
@@ -685,12 +708,16 @@ Review the site at ${serverUrl}. Use --quick mode. Skip any AskUserQuestion call
     const reportPath = path.join(qaDesignDir, 'design-audit.md');
     const reportExists = fs.existsSync(reportPath);
 
-    // Check if any design fix commits were made
-    const gitLog = spawnSync('git', ['log', '--oneline'], {
+    // Outcome: the report names a seeded defect, and the page changed (committed
+    // or not) relative to the initial fixture commit. The commit prefix is not required.
+    const report = reportExists ? fs.readFileSync(reportPath, 'utf-8') : '';
+    const namesSeededDefect = /4[78]px|line-height|border-radius|radius|padding|spacing|heading/i.test(report);
+    const initialCommit = spawnSync('git', ['rev-list', '--max-parents=0', 'HEAD'], {
       cwd: qaDesignDir, stdio: 'pipe', timeout: 30_000,
-    });
-    const commits = gitLog.stdout.toString().trim().split('\n');
-    const designFixCommits = commits.filter((c: string) => c.includes('style(design)'));
+    }).stdout.toString().trim();
+    const pageChanged = spawnSync('git', ['diff', '--name-only', initialCommit, '--', 'index.html', 'style.css'], {
+      cwd: qaDesignDir, stdio: 'pipe', timeout: 30_000,
+    }).stdout.toString().trim() !== '';
 
     // The agent must actually drive Aside: an `aside repl` Bash call, a printed sentinel
     // (from a tool_result, never the input), and no reach for the retired browse binary.
@@ -702,7 +729,8 @@ Review the site at ${serverUrl}. Use --quick mode. Skip any AskUserQuestion call
     const usedBrowseBin = bashCommands.some(c => /browse\/dist\/browse|\$B /.test(c));
 
     recordE2E(evalCollector, '/design-review fix', 'Design Review E2E', result, {
-      passed: ['success', 'error_max_turns'].includes(result.exitReason) && droveAside && sentinelPrinted && !usedBrowseBin,
+      passed: ['success', 'error_max_turns'].includes(result.exitReason) && droveAside && sentinelPrinted && !usedBrowseBin
+        && reportExists && namesSeededDefect && pageChanged,
     });
 
     // Accept error_max_turns — the fix loop is complex
@@ -710,15 +738,9 @@ Review the site at ${serverUrl}. Use --quick mode. Skip any AskUserQuestion call
     expect(droveAside).toBe(true);
     expect(sentinelPrinted).toBe(true);
     expect(usedBrowseBin).toBe(false);
-
-    // Report and commits are best-effort — log what happened
-    if (reportExists) {
-      const report = fs.readFileSync(reportPath, 'utf-8');
-      console.log(`Design audit report: ${report.length} chars`);
-    } else {
-      console.warn('No design-audit.md generated');
-    }
-    console.log(`Design fix commits: ${designFixCommits.length}`);
+    expect(reportExists, 'design-audit.md must be written').toBe(true);
+    expect(namesSeededDefect, 'the report names a seeded design defect').toBe(true);
+    expect(pageChanged, 'at least one design issue is fixed in index.html or style.css').toBe(true);
   }, CAPTURE_LONG_MS);
 });
 
@@ -749,6 +771,264 @@ function detectorSkillText(sections: Array<[string, string]>): string {
 function makeFakeEngine(): string {
   return installFakeImpeccable('skill-e2e-fake-impeccable-').dir;
 }
+
+function detectorReportEntries(report: string): string[] {
+  return report.split(/(?=^[\t ]*(?:#{1,6}\s+|[-*|]\s*|\d+[.)]\s+)?(?:\*\*|`)?FINDING-\d+)/m);
+}
+
+const INSTALL_OR_OVERRIDE = /\bnpx\b|gstack-design-detect\.ts install|\b(?:curl|wget|npm install|bun add)\b|IMPECCABLE_BIN\s*=/;
+
+/** A quoted-delimiter heredoc body is literal data, so a report that says
+ * "no npx" is not an npx run. Unquoted bodies still expand and stay checked;
+ * an unterminated body keeps the whole command checked. */
+function executedShellText(command: string): string {
+  const kept: string[] = [];
+  let delimiter: string | undefined, tabs = false;
+  for (const line of command.split('\n')) {
+    if (delimiter !== undefined) {
+      if ((tabs ? line.replace(/^\t*/, '') : line) === delimiter) delimiter = undefined;
+      continue;
+    }
+    kept.push(line);
+    const quoted = /<<(-)?[ \t]*(?:'([^'\n]+)'|"([^"\n]+)"|\\(\w+))/.exec(line);
+    if (quoted) { delimiter = quoted[2] ?? quoted[3] ?? quoted[4]; tabs = !!quoted[1]; }
+  }
+  return delimiter === undefined ? kept.join('\n') : command;
+}
+
+function commandRunsInstallOrOverride(command: string): boolean {
+  return INSTALL_OR_OVERRIDE.test(executedShellText(command));
+}
+
+const SOURCE_SCAN = /gstack-design-detect\.ts scan --changed (?:main|'main'|"main"|"?\$\{?\w+\}?"?)(?=[\s;]|$)/;
+
+/** CI 37111582659 (6fb8ea3d): the model resolved the base through the excerpt's gh fallback and
+ * scanned `--changed "$_BASE"`. The command proves the detector scan ran; the engine's single
+ * invocation over exactly the files changed vs main proves its base resolved to main. */
+function sourceScanAgainstMain(commands: string[], invocations: string[], repoDir: string): boolean {
+  if (!commands.some(command => SOURCE_SCAN.test(executedShellText(command))) || invocations.length !== 1) return false;
+  const argv = (JSON.parse(invocations[0]!) as { argv?: unknown }).argv;
+  if (!Array.isArray(argv) || argv[0] !== 'detect' || argv[1] !== '--json') return false;
+  const root = fs.realpathSync(repoDir);
+  const targets = argv.slice(2).map(target => fs.existsSync(String(target)) ? path.relative(root, fs.realpathSync(String(target))) : '');
+  return targets.join() === 'index.html,styles.css';
+}
+
+if (!evalsEnabled) test('plugin handoff credits an executed source scan whose base resolved to main', () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'plugin-scan-replay-'));
+  try {
+    for (const file of ['index.html', 'styles.css', 'other.css']) fs.writeFileSync(path.join(repoDir, file), '');
+    const engine = (...files: string[]) => JSON.stringify({ argv: ['detect', '--json', ...files.map(file => path.join(repoDir, file))], cwd: repoDir, stdinIsTTY: false });
+    const detect = '/__w/gstack/gstack/bin/gstack-design-detect.ts';
+    // Captured CI 37111582659 command (paths shortened): gh fallback resolved _BASE=main.
+    const captured = `_BASE=$(gh pr view --json baseRefName -q .baseRefName 2>/dev/null || true); if [ -z "$_BASE" ]; then _BASE=main; fi; git diff --name-only "$_BASE"...HEAD; _DJ=$(mktemp); bun --no-env-file run ${detect} scan --changed "$_BASE" --format gstack --host claude > "$_DJ" 2>/tmp/scan-stderr.txt; echo "DETECT_EXIT_CODE=$?"`;
+    const literal = `_DJ=$(mktemp); bun --no-env-file run ${detect} scan --changed main --format gstack --host claude > "$_DJ"; echo "DETECT_EXIT_CODE=$?"`;
+    const reportOnly = `cat > detector-output.md <<'EOF'\nScan: \`bun --no-env-file run ${detect} scan --changed main --format gstack --host claude\`\nEOF`;
+    expect(sourceScanAgainstMain([captured], [engine('index.html', 'styles.css')], repoDir)).toBe(true);
+    expect(sourceScanAgainstMain([literal, reportOnly], [engine('index.html', 'styles.css')], repoDir)).toBe(true);
+    expect(sourceScanAgainstMain([literal.replace('--changed main', "--changed 'main'")], [engine('index.html', 'styles.css')], repoDir)).toBe(true);
+    // Negative controls: quoted report text, another literal base, a base that resolved elsewhere, no or extra engine runs, a direct engine call.
+    expect(sourceScanAgainstMain([reportOnly], [engine('index.html', 'styles.css')], repoDir)).toBe(false);
+    expect(sourceScanAgainstMain([literal.replace('--changed main', '--changed HEAD~1')], [engine('index.html', 'styles.css')], repoDir)).toBe(false);
+    expect(sourceScanAgainstMain([captured], [engine('styles.css')], repoDir)).toBe(false);
+    expect(sourceScanAgainstMain([captured], [engine('index.html', 'other.css', 'styles.css')], repoDir)).toBe(false);
+    expect(sourceScanAgainstMain([captured], [], repoDir)).toBe(false);
+    expect(sourceScanAgainstMain([captured], [engine('index.html', 'styles.css'), engine('index.html', 'styles.css')], repoDir)).toBe(false);
+    expect(sourceScanAgainstMain(['impeccable detect --json index.html styles.css'], [engine('index.html', 'styles.css')], repoDir)).toBe(false);
+    expect(sourceScanAgainstMain([literal.replace('--changed main', '--changed mainline')], [engine('index.html', 'styles.css')], repoDir)).toBe(false);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+if (!evalsEnabled) test('plugin handoff counts executed install commands, not quoted report text', () => {
+  // PR lane 36794871032: the report heredoc said "no `npx impeccable`" and failed noInstallOrOverride.
+  const reportWrite = "cat > detector-output.md <<'EOF'\n# Detector output\n- No install, no launcher, no `npx impeccable`, no Impeccable skill files read.\nEOF\necho \"written: $(wc -l < detector-output.md) lines\"; git status --short";
+  expect(commandRunsInstallOrOverride(reportWrite)).toBe(false);
+  expect(commandRunsInstallOrOverride(reportWrite.replace("<<'EOF'", '<<"EOF"'))).toBe(false);
+  expect(commandRunsInstallOrOverride(reportWrite.replace("<<'EOF'", '<<\\EOF'))).toBe(false);
+  expect(commandRunsInstallOrOverride(reportWrite.replace("<<'EOF'", "<<-'EOF'").replace('\nEOF\n', '\n\t\tEOF\n'))).toBe(false);
+  expect(commandRunsInstallOrOverride('npx impeccable detect .')).toBe(true);
+  expect(commandRunsInstallOrOverride('IMPECCABLE_BIN=/tmp/x bun run detect.ts probe')).toBe(true);
+  expect(commandRunsInstallOrOverride(reportWrite.replace("<<'EOF'", '<<EOF').replace('`npx impeccable`', '$(npx impeccable)'))).toBe(true);
+  expect(commandRunsInstallOrOverride(reportWrite + '\nnpx impeccable detect .')).toBe(true);
+  expect(commandRunsInstallOrOverride(reportWrite.replace('\nEOF\n', '\nEO\n'))).toBe(true);
+});
+
+if (!evalsEnabled) test('detector report handoffs stay with their entry across inline cross-references', () => {
+  const report = `### FINDING-001 \`[low-contrast]\` — impact=high — DEFERRED
+handoff=\`/impeccable colorize\`
+
+### FINDING-002 \`[ai-color-palette]\` — impact=medium — DEFERRED
+The colors also appear in FINDING-001. This is unconfirmed static evidence.
+handoff=\`/impeccable colorize\`
+
+### FINDING-003 \`[skipped-heading]\` — impact=medium — DEFERRED
+handoff=\`/impeccable typeset\`
+`;
+  const hasPaletteHandoff = (text: string) => detectorReportEntries(text).some(entry => entry.includes('[ai-color-palette]') && entry.includes('/impeccable colorize'));
+  expect(hasPaletteHandoff(report)).toBe(true);
+  expect(hasPaletteHandoff(report.replace('handoff=`/impeccable colorize`\n\n### FINDING-003', '### FINDING-003'))).toBe(false);
+  for (const marker of ['.', ')']) {
+    const numbered = report.replace(/^### FINDING-(\d+)/gm, (_, number) => `${Number(number)}${marker} **FINDING-${number}**`);
+    expect(hasPaletteHandoff(numbered)).toBe(true);
+    expect(hasPaletteHandoff(numbered.replace(`handoff=\`/impeccable colorize\`\n\n3${marker}`, `3${marker}`))).toBe(false);
+  }
+});
+
+function pluginDetectorFixture() {
+  const fixture = installFakeImpeccable('skill-e2e-plugin-');
+  const repoDir = path.join(fixture.dir, 'repo');
+  const home = path.join(fixture.dir, 'home');
+  const configDir = path.join(fixture.dir, 'custom-claude');
+  const gstackHome = path.join(fixture.dir, 'gstack');
+  const impeccableHome = path.join(fixture.dir, 'engine-cache');
+  for (const dir of [repoDir, home, configDir, gstackHome, impeccableHome]) fs.mkdirSync(dir);
+  const env = hermeticChildEnv({
+    HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: configDir,
+    GSTACK_HOME: gstackHome, IMPECCABLE_HOME: impeccableHome,
+    CLAUDE_PLUGIN_DATA: '', GSTACK_HEADLESS: '1',
+  });
+  for (const key of Object.keys(env)) if (key.startsWith('IMPECCABLE_') && key !== 'IMPECCABLE_HOME') delete env[key];
+  const engines: Record<string, string> = {};
+  for (const version of ['4.3.1', '4.10.0']) {
+    const skillDir = path.join(configDir, 'plugins/cache/fixture-market/impeccable', version, 'skills/impeccable');
+    const scripts = path.join(skillDir, 'scripts');
+    const engineDir = path.join(scripts, 'bin', `${process.platform}-${process.arch}`);
+    fs.mkdirSync(engineDir, { recursive: true });
+    fs.writeFileSync(path.join(skillDir, 'SKILL.md'), '# Impeccable fixture marker\n');
+    fs.writeFileSync(path.join(scripts, 'impeccable'), `#!/bin/sh\nprintf launcher > '${fixture.dir}/launcher-ran'\nexit 99\n`, { mode: 0o755 });
+    fs.writeFileSync(path.join(scripts, 'VERSION'), '1.6.0\n');
+    engines[version] = path.join(engineDir, 'impeccable');
+    fs.writeFileSync(engines[version], `#!/bin/sh\nIMPECCABLE_FAKE_LOG='${fixture.dir}/${version}.jsonl' exec '${process.execPath}' '${fixture.bin}' "$@"\n`, { mode: 0o755 });
+    engines[version] = fs.realpathSync(engines[version]);
+  }
+  const git = (...args: string[]) => {
+    const result = spawnSync('git', args, { cwd: repoDir, env, encoding: 'utf-8', timeout: 5000 });
+    if (result.status !== 0) throw new Error(`Plugin fixture git ${args[0]} failed: ${result.stderr}`);
+  };
+  git('init', '-b', 'main');
+  git('config', 'user.email', 'test@test.com');
+  git('config', 'user.name', 'Test');
+  fs.writeFileSync(path.join(repoDir, 'index.html'), '<h1>Clean</h1>\n');
+  git('add', '.');
+  git('commit', '-m', 'initial');
+  git('checkout', '-b', 'feature/landing');
+  fs.copyFileSync(path.join(ROOT, 'test/fixtures/review-eval-design-slop.html'), path.join(repoDir, 'index.html'));
+  fs.copyFileSync(path.join(ROOT, 'test/fixtures/review-eval-design-slop.css'), path.join(repoDir, 'styles.css'));
+  git('add', '.');
+  git('commit', '-m', 'landing page');
+  // The engine reports this repository's files and lines, so its evidence is checkable where the page links it.
+  const located = (file: string, needle: string) => ({ file, line: fs.readFileSync(path.join(repoDir, file), 'utf-8').split('\n').findIndex(text => text.includes(needle)) + 1 });
+  const sample = path.join(fixture.dir, 'impeccable-detect-sample.json');
+  fs.writeFileSync(sample, JSON.stringify((JSON.parse(fs.readFileSync(sample, 'utf-8')) as Array<Record<string, unknown>>).map(finding => {
+    const snippet = String(finding.snippet);
+    const where = finding.antipattern === 'skipped-heading' ? located('index.html', 'Feature One')
+      : finding.antipattern === 'marketing-buzzword' ? located('index.html', 'streamline')
+      : located('styles.css', /on (#[0-9a-f]{6})/.exec(snippet)?.[1] ?? '#8b5cf6');
+    return { ...finding, ...where };
+  }), null, 2));
+  fs.writeFileSync(path.join(repoDir, 'design-review-detector.md'), detectorSkillText([
+    ['**Design detector (optional, deterministic):**', '**Create output directories:**'],
+    ['**Phase 0: mechanical scan**', '## Phases 1-6'],
+  ]));
+  return { dir: fixture.dir, repoDir, env, engines };
+}
+
+if (!evalsEnabled) test('plugin detector fixture discovers the selected engine without an override', () => {
+  const fixture = pluginDetectorFixture();
+  try {
+    expect(fixture.env.IMPECCABLE_BIN).toBeUndefined();
+    const probe = spawnSync(process.execPath, ['--no-env-file', 'run', path.join(ROOT, 'bin/gstack-design-detect.ts'), 'probe', '--host', 'claude'], {
+      cwd: fixture.repoDir, env: fixture.env, encoding: 'utf-8', timeout: 10000,
+    });
+    expect(probe.status).toBe(0);
+    expect(probe.stdout).toContain(`IMPECCABLE_READY: ${fixture.engines['4.10.0']}`);
+    expect(probe.stdout).toContain('IMPECCABLE_SKILL: present');
+    const scan = spawnSync(process.execPath, ['--no-env-file', 'run', path.join(ROOT, 'bin/gstack-design-detect.ts'), 'scan', '--changed', 'main', '--host', 'claude'], {
+      cwd: fixture.repoDir, env: fixture.env, encoding: 'utf-8', timeout: 10000,
+    });
+    expect(scan.status).toBe(2);
+    expect(scan.stderr).toContain('handoff=/impeccable colorize');
+    // Census 36709485593: rows naming test/fixtures/... paths absent from this repo cost four
+    // reconciliation turns and exceeded max turns. Every row must cite a repo file:line holding its evidence.
+    const rows = [...scan.stderr.matchAll(/^ {2}(\S+):(\d+) {2}(.*)$/gm)];
+    expect(rows).toHaveLength(6);
+    for (const [, file, line, snippet] of rows) {
+      const text = fs.readFileSync(path.join(fixture.repoDir, file!), 'utf-8').split('\n')[Number(line) - 1]!;
+      const evidence = /on (#[0-9a-f]{6})/.exec(snippet!)?.[1] ?? (/Purple/.test(snippet!) ? '#8b5cf6' : /buzzword/.test(snippet!) ? 'streamline' : 'Feature One');
+      expect(text, `${file}:${line}`).toContain(evidence);
+    }
+    const shipped = JSON.parse(fs.readFileSync(DETECT_SAMPLE, 'utf-8')) as Array<{ file: string }>;
+    expect(shipped.every(finding => !fs.existsSync(path.join(fixture.repoDir, finding.file)))).toBe(true);
+    expect(fs.existsSync(path.join(fixture.dir, '4.10.0.jsonl'))).toBe(true);
+    expect(fs.existsSync(path.join(fixture.dir, '4.3.1.jsonl'))).toBe(false);
+    expect(fs.existsSync(path.join(fixture.dir, 'launcher-ran'))).toBe(false);
+  } finally {
+    fs.rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+describeIfSelected('Design review plugin discovery E2E', ['design-review-plugin-handoff'], () => {
+  testConcurrentIfSelected('design-review-plugin-handoff', async () => {
+    const fixture = pluginDetectorFixture();
+    try {
+      const result = await runSkillTest({
+        prompt: `Load gstack's /design-review workflow by reading design-review-detector.md, the actual Setup detector and Phase 0 excerpt.
+Supported actor scope: read that excerpt, run its detector probe and one source-mode scan, then write detector-output.md. This isolated repository is on feature/landing; its base is main. There is no URL.
+Do not install or download anything, execute a launcher, change environment variables, browse, ask questions, spawn agents, or edit anything except detector-output.md. Do not read Impeccable skill files. If discovery fails, report that failure and stop; do not repair the environment.
+Write the probe's first line and skill-presence line, then one FINDING-NNN entry per DETECT_TOP rule with its [rule-id] and impact. All findings are deferred, unconfirmed static evidence because rendered-page confirmation is outside this actor's scope. Apply the excerpt's deferred-finding reporting requirements. Do not fix source files or claim visual verification.`,
+        workingDirectory: fixture.repoDir,
+        maxTurns: 10,
+        timeout: CAPTURE_MS,
+        testName: 'design-review-plugin-handoff',
+        runId,
+        tools: ['Bash', 'Read', 'Write'],
+        env: fixture.env,
+      });
+      logCost('/design-review plugin handoff', result);
+      const reportPath = path.join(fixture.repoDir, 'detector-output.md');
+      const report = fs.existsSync(reportPath) ? fs.readFileSync(reportPath, 'utf-8') : '';
+      const outputs = result.toolCalls.map(call => String(call.output ?? '')).join('\n');
+      const commands = result.toolCalls.filter(call => call.tool === 'Bash').map(call => String(call.input?.command ?? ''));
+      const handoffs = [...outputs.matchAll(/\[([\w-]+)\] impact=(\w+)[^\n]*handoff=(\/impeccable \w+)/g)];
+      const entries = detectorReportEntries(report);
+      const engineLog = path.join(fixture.dir, '4.10.0.jsonl');
+      const invocations = fs.existsSync(engineLog) ? fs.readFileSync(engineLog, 'utf-8').trim().split('\n') : [];
+      const sourceUnchanged = fs.readFileSync(path.join(fixture.repoDir, 'index.html'), 'utf-8') === fs.readFileSync(path.join(ROOT, 'test/fixtures/review-eval-design-slop.html'), 'utf-8');
+      if (process.env.GSTACK_EVAL_DIR) {
+        const evidenceDir = path.join(process.env.GSTACK_EVAL_DIR, 'plugin-handoff', `${Date.now()}`);
+        fs.mkdirSync(evidenceDir, { recursive: true, mode: 0o700 });
+        for (const [name, text] of Object.entries({
+          'report.md': report,
+          'skill-excerpt.md': fs.readFileSync(path.join(fixture.repoDir, 'design-review-detector.md'), 'utf-8'),
+          'engine-invocations.jsonl': invocations.join('\n'),
+        })) fs.writeFileSync(path.join(evidenceDir, name), text, { mode: 0o600 });
+      }
+      const checks = {
+        success: result.exitReason === 'success',
+        selectedEngine: outputs.includes(`IMPECCABLE_READY: ${fixture.engines['4.10.0']}`),
+        skillPresent: outputs.includes('IMPECCABLE_SKILL: present'),
+        probeReported: report.includes(`IMPECCABLE_READY: ${fixture.engines['4.10.0']}`) && report.includes('IMPECCABLE_SKILL: present'),
+        probeExecuted: commands.some(command => /gstack-design-detect\.ts probe/.test(command)),
+        scanExecuted: sourceScanAgainstMain(commands, invocations, fixture.repoDir),
+        noInstallOrOverride: !commands.some(commandRunsInstallOrOverride),
+        oneNewEngineInvocation: invocations.length === 1,
+        oldEngineNotExecuted: !fs.existsSync(path.join(fixture.dir, '4.3.1.jsonl')),
+        launcherNotExecuted: !fs.existsSync(path.join(fixture.dir, 'launcher-ran')),
+        sourceUnchanged,
+        findingsReported: report.includes('FINDING-001') && report.includes('[ai-color-palette]') && report.includes('[low-contrast]'),
+        deferred: /deferred/i.test(report),
+        nonemptyHandoffs: handoffs.length > 0,
+        perFindingHandoff: handoffs.every(([, rule, impact, command]) => entries.some(entry => entry.includes(`[${rule}]`) && entry.toLowerCase().includes(impact) && entry.includes(command))),
+      };
+      recordE2E(evalCollector, '/design-review plugin handoff', 'Design review plugin discovery E2E', result, { passed: Object.values(checks).every(Boolean) });
+      expect(Object.entries(checks).filter(([, passed]) => !passed).map(([name]) => name)).toEqual([]);
+    } finally {
+      fs.rmSync(fixture.dir, { recursive: true, force: true });
+    }
+  }, CAPTURE_MS);
+});
 
 describeIfSelected('Design review detector shim E2E', ['design-review-detector-shim', 'design-review-detector-shim-dom'], () => {
   let repoDir: string;
@@ -791,38 +1071,131 @@ describeIfSelected('Design review detector shim E2E', ['design-review-detector-s
   });
 
   testConcurrentIfSelected('design-review-detector-shim', async () => {
-    const result = await runSkillTest({
-      prompt: `You are in a git repo on branch feature/landing with changes against main (the base branch).
+    const started = Date.now();
+    let evidenceDir: string | undefined;
+    let result: SkillTestResult | undefined;
+    let passed = false;
+    let failure: unknown;
+    try {
+      evidenceDir = fs.mkdtempSync(path.join(os.tmpdir(), 'detector-source-evidence-'));
+      const receiptPath = path.join(evidenceDir, 'calls.jsonl');
+      const outPath = path.join(repoDir, 'detector-output.md');
+      fs.rmSync(outPath, { force: true });
+      fs.writeFileSync(path.join(evidenceDir, 'bun'), `#!${process.execPath}
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { spawnSync } from 'node:child_process';
+const argv = process.argv.slice(2);
+const wrapper = argv.findIndex(arg => {
+  try { return fs.realpathSync(path.resolve(arg)) === ${JSON.stringify(fs.realpathSync(path.join(ROOT, 'bin', 'gstack-design-detect.ts')))}; }
+  catch { return false; }
+});
+const dir = wrapper < 0 ? null : fs.mkdtempSync(${JSON.stringify(path.join(evidenceDir, 'call-'))});
+const log = dir && path.join(dir, 'engine.jsonl');
+const run = spawnSync(process.execPath, argv, {
+  cwd: process.cwd(), stdio: 'inherit', timeout: ${CAPTURE_MS},
+  env: { ...process.env, ...(log ? { IMPECCABLE_FAKE_LOG: log } : {}) },
+});
+if (dir) fs.appendFileSync(${JSON.stringify(receiptPath)}, JSON.stringify({
+  argv: argv.slice(wrapper + 1), cwd: process.cwd(), exit: run.status,
+  engine: log && fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\\n').map(line => JSON.parse(line)) : [],
+}) + '\\n', { mode: 0o600 });
+process.exitCode = run.status ?? 1;
+`, { mode: 0o755 });
+      result = await runSkillTest({
+        prompt: `You are in a git repo on branch feature/landing with changes against main (the base branch).
 Read design-review-detector.md: it is the Setup "Design detector" block and "Phase 0: mechanical scan" from /design-review.
 This is a diff-aware run with no URL, so it is SOURCE mode. Run the probe, then the Phase 0 source-mode scan with base main, exactly as written (use --host claude).
 Do not run any browser step, do not fix anything, do not run npx.
 Then write ${repoDir}/detector-output.md: one FINDING-NNN row per rule in the DETECT_TOP block, each tagged with its [rule-id] and the printed impact, plus the first line the probe printed.`,
-      workingDirectory: repoDir,
-      maxTurns: 15,
-      timeout: CAPTURE_MS,
-      testName: 'design-review-detector-shim',
-      runId,
-      env: { IMPECCABLE_BIN: path.join(engineDir, 'impeccable'), IMPECCABLE_FAKE_OUTPUT: DETECT_SAMPLE },
-    });
+        workingDirectory: repoDir,
+        maxTurns: 15,
+        timeout: CAPTURE_MS,
+        testName: 'design-review-detector-shim',
+        runId,
+        env: {
+          IMPECCABLE_BIN: path.join(engineDir, 'impeccable'), IMPECCABLE_FAKE_OUTPUT: DETECT_SAMPLE,
+          PATH: `${evidenceDir}${path.delimiter}${process.env.PATH ?? ''}`,
+        },
+      });
 
-    logCost('/design-review detector shim (source)', result);
-    recordE2E(evalCollector, '/design-review detector shim', 'Design review detector shim E2E (source mode)', result);
-    expect(result.exitReason).toBe('success');
+      logCost('/design-review detector shim (source)', result);
+      expect(result.exitReason).toBe('success');
+      expect(result.browseErrors).toEqual([]);
 
-    const bash = result.toolCalls.filter(c => c.tool === 'Bash').map(c => String(c.input?.command ?? ''));
-    expect(bash.some(c => c.includes('gstack-design-detect.ts probe'))).toBe(true);
-    expect(bash.some(c => /gstack-design-detect\.ts scan --changed main/.test(c))).toBe(true);
-    expect(bash.some(c => c.includes('npx impeccable'))).toBe(false);
-    // The sentinel is evidence in the tool output and the report, not something the
-    // agent must repeat in its closing message.
-    const toolOutputs = result.toolCalls.map(c => String(c.output ?? '')).join('\n');
-    const outPath = path.join(repoDir, 'detector-output.md');
-    expect(fs.existsSync(outPath)).toBe(true);
-    const out = fs.readFileSync(outPath, 'utf-8');
-    expect(toolOutputs.includes('IMPECCABLE_READY') || out.includes('IMPECCABLE_READY')).toBe(true);
-    expect(out).toContain('FINDING-001');
-    expect(out).toContain('[ai-color-palette]');
-    expect(out).toContain('[low-contrast]');
+      const bash = result.toolCalls.filter(c => c.tool === 'Bash').map(c => String(c.input?.command ?? ''));
+      expect(bash.some(c => c.includes('npx impeccable'))).toBe(false);
+      // `$B` runs the browse binary only in command position; a shell variable
+      // named B (a base branch, say) is not a browser step.
+      expect(bash.some(c => /(?:^|[;&|(\n]|\b(?:then|do|else)\b)\s*"?\$B"?\s+\S|\bbrowse\s|\baside\s+repl\b|\bplaywright\b|\bpuppeteer\b/.test(c))).toBe(false);
+      expect(result.toolCalls.some(c => /browser|browse|playwright|puppeteer/i.test(c.tool))).toBe(false);
+      const calls: Array<{ argv: string[]; cwd: string; exit: number; engine: Array<{ argv: string[]; cwd: string }> }> =
+        fs.readFileSync(receiptPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      const probes = calls.filter(c => c.argv[0] === 'probe');
+      expect(probes.length).toBeGreaterThan(0);
+      for (const probe of probes) {
+        expect(probe.argv).toEqual(['probe', '--host', 'claude']);
+        expect(probe.cwd).toBe(fs.realpathSync(repoDir));
+        expect(probe.exit).toBe(0);
+      }
+      const scans = calls.filter(c => c.argv[0] === 'scan');
+      expect(scans.length).toBeGreaterThan(0);
+      for (const scan of scans) {
+        expect(scan.cwd).toBe(fs.realpathSync(repoDir));
+        expect(scan.exit).toBe(2);
+        expect(scan.argv[scan.argv.indexOf('--changed') + 1]).toBe('main');
+        expect(scan.argv[scan.argv.indexOf('--host') + 1]).toBe('claude');
+        expect(scan.argv[scan.argv.indexOf('--format') + 1]).toBe('gstack');
+        expect(scan.argv.slice(1).sort()).toEqual(['--changed', 'main', '--format', 'gstack', '--host', 'claude'].sort());
+        expect(scan.engine).toHaveLength(1);
+        expect(scan.engine[0].cwd).toBe(fs.realpathSync(repoDir));
+        expect(scan.engine[0].argv).toEqual(['detect', '--json',
+          fs.realpathSync(path.join(repoDir, 'index.html')), fs.realpathSync(path.join(repoDir, 'styles.css'))]);
+      }
+      const toolOutputs = result.toolCalls.map(c => String(c.output ?? '')).join('\n');
+      expect(fs.existsSync(outPath)).toBe(true);
+      const out = fs.readFileSync(outPath, 'utf-8');
+      expect(toolOutputs.includes('IMPECCABLE_READY') || out.includes('IMPECCABLE_READY')).toBe(true);
+      expect(out).toContain('FINDING-001');
+      expect(out).toContain('[ai-color-palette]');
+      expect(out).toContain('[low-contrast]');
+      passed = true;
+    } catch (error) {
+      failure = error;
+      throw error;
+    } finally {
+      let artifactNote = '';
+      if (evidenceDir && (process.env.EVALS_RUN_ID || process.env.GSTACK_EVAL_DIR)) {
+        try {
+          const segment = (process.env.EVALS_RUN_ID || 'local').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 120);
+          const root = path.resolve(process.env.GSTACK_EVAL_DIR || getProjectEvalDir(), 'design-detector', segment);
+          fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+          const retained = fs.mkdtempSync(path.join(root, `design-review-detector-shim-${started}-`));
+          fs.chmodSync(retained, 0o700);
+          const receipt = path.join(evidenceDir, 'calls.jsonl');
+          fs.writeFileSync(path.join(retained, 'calls.jsonl'), fs.existsSync(receipt) ? fs.readFileSync(receipt, 'utf8') : '', { mode: 0o600 });
+          artifactNote = `Detector artifacts: ${retained}`;
+          console.log(artifactNote);
+        } catch (error) {
+          artifactNote = `Detector artifact write failed: ${String(error)}`;
+          console.error(artifactNote);
+        }
+      }
+      if (evidenceDir) { try { fs.rmSync(evidenceDir, { recursive: true, force: true }); } catch {} }
+      const error = (failure instanceof Error ? failure.message : String(failure)) + (artifactNote ? `\n${artifactNote}` : '');
+      if (result) {
+        recordE2E(evalCollector, '/design-review detector shim', 'Design review detector shim E2E (source mode)', result, {
+          passed, ...(passed ? {} : { error }),
+        });
+      } else {
+        evalCollector?.addTest({
+          name: '/design-review detector shim', suite: 'Design review detector shim E2E (source mode)', tier: 'e2e',
+          passed: false, duration_ms: Date.now() - started, cost_usd: 0,
+          model: process.env.EVALS_MODEL ?? resolveEvalModel('capture'), exit_reason: 'harness_error',
+          error: `${error}\nRunner returned no result; cost and usage unavailable.`,
+        });
+      }
+    }
   }, CAPTURE_MS);
 
   // DOM mode needs a browser engine for the dump: gstack's own browse binary

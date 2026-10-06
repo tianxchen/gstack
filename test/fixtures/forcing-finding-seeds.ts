@@ -96,6 +96,7 @@ export const FORCING_FLOOR_DEVEX = [
  * the [N-1] tolerance from the existing finding-count band convention.
  */
 export const FORCING_BATCHING_ENG = [
+  'Proceed directly to the requested engineering review; skip the optional /office-hours prerequisite.',
   'Please review this plan thoroughly. As you go, write your plan-mode plan to /tmp/gstack-test-plan-eng-batching.md (use Edit/Write to that exact path).',
   '',
   '# Plan: Add background job retry framework',
@@ -144,6 +145,8 @@ export const FORCING_BATCHING_ENG = [
  */
 export const FORCING_SPLIT_OVERFLOW_CEO = [
   'Please review this plan and help me decide scope. Write your plan-mode plan to /tmp/gstack-test-plan-ceo-split-overflow.md (use Edit/Write to that exact path).',
+  'Proceed directly to the requested CEO review; skip the optional /office-hours prerequisite.',
+  'Use HOLD SCOPE mode for this review.',
   '',
   '# Plan: Pick which chat-platform integrations to ship this quarter',
   '',

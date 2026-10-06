@@ -11,12 +11,13 @@
  */
 import type { TemplateContext } from './types';
 import { CC_BACKGROUND_DEFAULT_SINCE } from './constants';
+import { learningsCapture, LEARNINGS_VERDICT } from './learnings';
 
 function generateSpecialistSelection(ctx: TemplateContext): string {
   const isShip = ctx.skillName === 'ship';
   const stepSel = isShip ? '9.1' : '4.5';
   const stepMerge = isShip ? '9.2' : '4.6';
-  const nextStep = isShip ? 'the Fix-First flow (item 4)' : 'Step 5';
+  const nextStep = isShip ? 'Step 9.3 (cross-review dedup)' : 'Step 4.8 (adversarial review), then Step 5';
   return `## Step ${stepSel}: Review Army — Specialist Dispatch
 
 ### Detect stack and scope
@@ -60,7 +61,7 @@ Based on the scope signals above, select which specialists to dispatch.
 1. **Testing** — read \`${ctx.paths.skillRoot}/review/specialists/testing.md\`
 2. **Maintainability** — read \`${ctx.paths.skillRoot}/review/specialists/maintainability.md\`
 
-**If DIFF_LINES < 50:** Skip all specialists. Print: "Small diff ($DIFF_LINES lines) — specialists skipped." Continue to ${nextStep}.
+**If DIFF_LINES < 50:** Skip all specialists. Print: "Small diff ($DIFF_LINES lines) — specialists skipped." Continue to Step ${stepMerge} with the ${isShip ? 'core/design-lite' : 'core'} findings and an empty specialist list, then the parent's Exploratory QA step and ${nextStep}. Small diffs skip fan-out, never the parent-owned smoke probes. Core shared-code checks also remain required.
 
 **Conditional (dispatch if the matching scope signal is true):**
 3. **Security** — if SCOPE_AUTH=true, OR if SCOPE_BACKEND=true AND DIFF_LINES > 100. Read \`${ctx.paths.skillRoot}/review/specialists/security.md\`
@@ -95,26 +96,29 @@ so they run in parallel. Each subagent has fresh context — no prior review bia
 
 Construct the prompt for each specialist. The prompt includes:
 
-1. The specialist's checklist content (you already read the file above)
+1. The specialist's checklist path from the selection above (the subagent reads it; never paste its content)
 2. Stack context: "This is a {STACK} project."
 3. Past learnings for this domain (if any exist):
 
 \`\`\`bash
-${ctx.paths.binDir}/gstack-learnings-search --type pitfall --query "{specialist domain}" --limit 5 2>/dev/null || true
+${learningsCapture(`${ctx.paths.binDir}/gstack-learnings-search --type pitfall --query "{specialist domain}" --limit 5`)}
+${LEARNINGS_VERDICT}
 \`\`\`
 
 If learnings are found, include them: "Past learnings for this domain: {learnings}"
 
 4. Instructions:
 
-"You are a specialist code reviewer. Read the checklist below, then run
+"You are a specialist code reviewer. Read the checklist at {checklist path}, then run
 \`DIFF_BASE=$(git merge-base origin/<base> HEAD) && git diff "$DIFF_BASE"\` to get the full diff. Apply the checklist against the diff.
 
 For each finding, output a JSON object on its own line:
 {\\"severity\\":\\"CRITICAL|INFORMATIONAL\\",\\"confidence\\":N,\\"path\\":\\"file\\",\\"line\\":N,\\"category\\":\\"category\\",\\"summary\\":\\"description\\",\\"fix\\":\\"recommended fix\\",\\"fingerprint\\":\\"path:line:category\\",\\"specialist\\":\\"name\\"}
 
 Required fields: severity, confidence, path, category, summary, specialist.
-Optional: line, fix, fingerprint, evidence, test_stub.
+Optional: line, fix, fingerprint, evidence, test_stub, advisory, evidence_paths, helper_target.
+
+Optional extraction advice belongs to the core shared-code check; do not duplicate its proposals. Report real defects in duplicated code independently. Preserve advisory metadata when returning structural advice, and never label a demonstrated defect advisory merely because sharing a helper could fix it.
 
 If you can write a test that would catch this issue, include it in the \`test_stub\` field.
 Use the detected test framework ({TEST_FW}). Write a minimal skeleton — describe/it/test
@@ -124,64 +128,85 @@ If no findings: output \`NO FINDINGS\` and nothing else.
 Do not output anything else — no preamble, no summary, no commentary.
 
 Stack context: {STACK}
-Past learnings: {learnings or 'none'}
-
-CHECKLIST:
-{checklist content}"
+Past learnings: {learnings or 'none'}"
 
 **Subagent configuration:**
 - Use \`subagent_type: "general-purpose"\`
-- Pass \`run_in_background: false\` on every specialist Agent call — subagents run in the BACKGROUND by default since ${CC_BACKGROUND_DEFAULT_SINCE}, and all specialists must complete before merge. (Merely omitting the flag no longer produces a foreground run; it must be explicitly false.)
-- If any specialist subagent fails or times out, log the failure and continue with results from successful specialists. Specialists are additive — partial results are better than no results.`;
+- Pass \`run_in_background: false\` on every specialist Agent call — background is the default since ${CC_BACKGROUND_DEFAULT_SINCE}; omitting the flag is not foreground.
+
+**Wait for readers before editing:**
+- Confirm that each task has finished or is stopped. A timeout alone does not prove termination. If a reader or writer is still active, wait; if its state is unknown, inspect its task/process status. If you cannot confirm it stopped, use the parent's Fix-First stop path without edits.
+- A failed task may be stopped without having completed its review. Record the failure and retain usable partial findings.
+- Continue independent evidence collection after a terminal failure. Missing dispatched coverage remains incomplete, never completed or clean; successful peers cannot replace it.`;
 }
 
 function generateFindingsMerge(ctx: TemplateContext): string {
   const isShip = ctx.skillName === 'ship';
   const stepMerge = isShip ? '9.2' : '4.6';
-  const stepSel = isShip ? '9.1' : '4.5';
-  const fixFirstRef = isShip ? 'the Fix-First flow (item 4)' : 'Step 5 Fix-First';
+  const fixFirstRef = isShip ? 'Step 9.3 dedup, then Step 9.4 Fix-First' : 'Step 5 Fix-First';
   const critPassRef = isShip ? 'the checklist pass (Step 9)' : 'the CRITICAL pass findings from Step 4';
   const persistRef = isShip ? 'the review-log persist' : 'the review-log entry in Step 5.8';
   return `### Step ${stepMerge}: Collect and merge findings
 
-After all specialist subagents complete, collect their outputs.
+Follow these stages in order. Validate core and specialist findings alike, but keep
+their source labels: specialist scoring is not the final review's defect count.
 
-**Parse findings:**
-For each specialist's output:
-1. If output is "NO FINDINGS" — skip, this specialist found nothing
-2. Otherwise, parse each line as a JSON object. Skip lines that are not valid JSON.
-3. Collect all parsed findings into a single list, tagged with their specialist name.
+#### 1. Parse outputs
 
-**Fingerprint and deduplicate:**
-For each finding, compute its fingerprint:
-- If \`fingerprint\` field is present, use it
-- Otherwise: \`{path}:{line}:{category}\` (if line is present) or \`{path}:{category}\`
+After specialist attempts settle, collect their outputs, tagged by actual source.
+Successful \`NO FINDINGS\` is a completed empty result. Otherwise parse each JSON line and
+skip invalid lines. Missing or unusable output is incomplete coverage, not an
+empty success. Retain each specialist's returned findings for activity stats.
 
-Group findings by fingerprint. For findings sharing the same fingerprint:
-- Keep the finding with the highest confidence score
-- Tag it: "MULTI-SPECIALIST CONFIRMED ({specialist1} + {specialist2})"
-- Boost confidence by +1 (cap at 10)
-- Note the confirming specialists in the output
+#### 2. Validate severity
 
-**Apply confidence gates:**
+For core and specialist findings with \`"severity":"CRITICAL"\` and \`"advisory":true\`,
+remove \`advisory\` and retain its \`CRITICAL\` severity. Treat these as defects before
+identity, merging, counting, scoring or Fix-First. Never downgrade severity to make
+advisory metadata consistent. Valid INFORMATIONAL advisories remain advisory in
+every category, including simplification.
+
+#### 3. Identify and merge
+
+Partition defects and advisories BEFORE grouping by fingerprint. Never merge a
+defect with advice, even on a supplied-hash collision. Neither higher-confidence
+advice nor a prior skipped extraction may replace, downgrade or suppress a defect.
+
+Compute identities for both core and specialist findings:
+- Shared-code advice (category \`shared-libs\` or fingerprint prefix \`shared-libs:\`):
+  call installed \`sharedLibsFingerprint\` from \`${ctx.paths.skillRoot}/lib/review-evidence.ts\`
+  with \`evidence_paths\` and \`helper_target\` as literal JSON on stdin, as in the core pass;
+  never trust a supplied hash or generate one yourself. Missing/malformed metadata
+  cannot deduplicate or reuse a saved decision.
+- Other findings: use supplied \`fingerprint\`, else \`{path}:{line}:{category}\`
+  or \`{path}:{category}\` when no line exists.
+
+Within the specialist list, merge matching identities in the same partition: keep
+the highest confidence and all source names. Confirmation by distinct specialists
+adds +1 (cap at 10) and \`MULTI-SPECIALIST CONFIRMED ({specialist1} + {specialist2})\`.
+Core findings never earn a specialist confidence boost. Preserve \`advisory\`,
+\`evidence_paths\` and \`helper_target\` through every merge.
+
+#### 4. Apply specialist confidence gates
+
 - Confidence 7+: show normally in the findings output
 - Confidence 5-6: show with caveat "Medium confidence — verify this is actually an issue"
 - Confidence 3-4: move to appendix (suppress from main findings)
 - Confidence 1-2: suppress entirely
 
-**Advisory carve-out (simplification specialist):**
-Findings with \`"advisory": true\` are excluded from BOTH the quality_score
-summation and the findings-count header below — they are structure suggestions,
-not defects, and must not make "5 findings … 10/10" look contradictory. In
-Fix-First they are ASK-only: NEVER auto-applied, even when mechanical.
+Core findings keep the core Confidence Calibration gates.
 
-**Compute PR Quality Score:**
-After merging, compute the quality score over NON-advisory findings only:
+#### 5. Score and present specialists
+
+Only specialist findings enter this header and \`quality_score\`; core findings do not.
+Use the merged NON-advisory specialist findings for both counts and score;
+the header's N is X + Y, so advisory findings never add to it:
 \`quality_score = max(0, 10 - (critical_count * 2 + informational_count * 0.5))\`
-Cap at 10. Log this in the review result at the end.
-
-**Output merged findings:**
-Present the merged findings in the same format as the current review:
+Cap at 10 and retain for ${persistRef}. These are not final unresolved-defect totals.
+Print only this block: the stage 6 activity object and \`test_stub\` bodies are log and Fix-First data.
+Validated \`"advisory": true\` findings from any source are excluded from score,
+header, unresolved-defect totals and clean-status blockers. Show them separately;
+they remain ASK-only, never auto-applied. Real defects follow normal Fix-First.
 
 \`\`\`
 SPECIALIST REVIEW: N findings (X critical, Y informational) from Z specialists
@@ -203,30 +228,36 @@ PR Quality Score: X/10
   \`Simplification: lean already — nothing to cut.\`
 - If it was not dispatched, print neither line.
 
-These findings flow into ${fixFirstRef} alongside ${critPassRef}.
-The Fix-First heuristic applies identically — specialist findings follow the same AUTO-FIX vs ASK classification (except advisory findings, which are ASK-only per the carve-out above).
+Do not add core shared-code savings to this specialist footer. Explain any overlap once in the core proposal instead of presenting duplicate savings.
 
-**Compile per-specialist stats:**
-After merging findings, compile a \`specialists\` object for ${persistRef}.
-For each specialist (testing, maintainability, security, performance, data-migration, api-contract, design, simplification, red-team):
+#### 6. Save specialist activity
+
+Compile a \`specialists\` object for ${persistRef}.
+${isShip ? 'For each specialist' : 'For DIFF_LINES < 50, keep `specialists: {}`; do not manufacture per-specialist scope records. Otherwise record each considered specialist'} (testing, maintainability, security, performance, data-migration, api-contract, design, simplification, red-team):
 - If dispatched: \`{"dispatched": true, "findings": N, "critical": N, "informational": N}\`
 - If skipped by scope: \`{"dispatched": false, "reason": "scope"}\`
 - If skipped by gating: \`{"dispatched": false, "reason": "gated"}\`
 - If not applicable (e.g., red-team not activated): omit from the object
 
-Advisory findings COUNT in the stats \`findings\` field — the advisory
-carve-out governs the quality score and the findings-count header only.
-Logging simplification's advisories as \`findings: 0\` would auto-gate the
-lens into permanent silence after 10 dispatches.
+Count only findings that specialist actually returned, before deduplication.
+Advisory findings COUNT in the stats \`findings\` field, not its defect counts.
+Include Design despite its different checklist. Preserve dispatch/failure status:
+zero returned findings from a failed attempt is not a clean review.
 
-Include the Design specialist even though it uses \`design-checklist.md\` instead of the specialist schema files.
-Remember these stats — you will need them for ${persistRef}.`;
+#### 7. Hand off to Fix-First
+
+Send these findings to ${fixFirstRef} alongside ${critPassRef}.
+Consolidate equivalent shared-code advice under the core proposal, retaining all
+sources and counting overlapping savings once. Keep actual specialist stats;
+core-only advice must not create a specialist dispatch or finding.
+Normal AUTO-FIX/ASK rules apply, with advice ASK-only. Missing coverage still blocks
+completion. Advice never permits edits while readers are active or replaces a required review.`;
 }
 
 function generateRedTeam(ctx: TemplateContext): string {
   const isShip = ctx.skillName === 'ship';
   const stepMerge = isShip ? '9.2' : '4.6';
-  const fixFirstRef = isShip ? 'the Fix-First flow (item 4)' : 'Step 5 Fix-First';
+  const fixFirstRef = isShip ? 'Step 9.3 dedup, then Step 9.4 Fix-First' : 'Step 5 Fix-First';
   return `### Red Team dispatch (conditional)
 
 **Activation:** Only if DIFF_LINES > 200 OR any specialist produced a CRITICAL finding.
@@ -234,22 +265,23 @@ function generateRedTeam(ctx: TemplateContext): string {
 If activated, dispatch one more subagent via the Agent tool (pass \`run_in_background: false\` — foreground; subagents default to background since ${CC_BACKGROUND_DEFAULT_SINCE}).
 
 The Red Team subagent receives:
-1. The red-team checklist from \`${ctx.paths.skillRoot}/review/specialists/red-team.md\`
-2. The merged specialist findings from Step ${stepMerge} (so it knows what was already caught)
+1. The red-team checklist path \`${ctx.paths.skillRoot}/review/specialists/red-team.md\` (it reads the file)
+2. The merged specialist findings from Step ${stepMerge}, one line each (so it knows what was already caught)
 3. The git diff command
 
 Prompt: "You are a red team reviewer. The code has already been reviewed by N specialists
 who found the following issues: {merged findings summary}. Your job is to find what they
-MISSED. Read the checklist, run \`DIFF_BASE=$(git merge-base origin/<base> HEAD) && git diff "$DIFF_BASE"\`, and look for gaps.
+MISSED. Read the checklist at {red-team checklist path}, run \`DIFF_BASE=$(git merge-base origin/<base> HEAD) && git diff "$DIFF_BASE"\`, and look for gaps.
 Output findings as JSON objects (same schema as the specialists). Focus on cross-cutting
 concerns, integration boundary issues, and failure modes that specialist checklists
 don't cover."
 
-If the Red Team finds additional issues, merge them into the findings list before
-${fixFirstRef}. Red Team findings are tagged with \`"specialist":"red-team"\`.
+If the Red Team finds additional issues, tag them \`"specialist":"red-team"\`.
+Add them to the original specialist outputs and rerun stages 1–7 of Step ${stepMerge}
+before ${fixFirstRef}; do not boost or count the earlier findings twice.
 
 If the Red Team returns NO FINDINGS, note: "Red Team review: no additional issues found."
-If the Red Team subagent fails or times out, skip silently and continue.`;
+If the Red Team fails or times out, confirm it stopped and record its review as incomplete, just as for other specialists. ${isShip ? "Return to the parent's Exploratory QA step, then dedup and persistence; Step 9.4 cannot certify missing dispatched coverage as completed or clean." : 'Continue independent Step 4.7 QA and Step 4.8 adversarial review; Step 5.8 cannot certify missing dispatched coverage as completed or clean.'}`;
 }
 
 export function generateReviewArmy(ctx: TemplateContext): string {

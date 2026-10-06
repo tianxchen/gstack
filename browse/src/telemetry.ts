@@ -20,11 +20,11 @@
 
 import { promises as fs } from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { readGstackConfigYamlKey } from './config';
+import { resolveStateRoot } from '../../lib/state-root';
 
 function gstackHome(): string {
-  return process.env.GSTACK_HOME || path.join(os.homedir(), '.gstack');
+  return resolveStateRoot();
 }
 
 function analyticsDir(): string {
@@ -97,10 +97,10 @@ export interface TelemetryEvent {
 }
 
 /** Fire-and-forget log. Never throws. */
-export function logTelemetry(payload: TelemetryEvent): void {
-  if (isTelemetryDisabled()) return;
+export function logTelemetry(payload: TelemetryEvent): Promise<void> {
+  if (isTelemetryDisabled()) return Promise.resolve();
   const enriched = { ...payload, ts: new Date().toISOString() };
-  ensureDir()
+  return ensureDir()
     .then(() => fs.appendFile(telemetryFile(), JSON.stringify(enriched) + '\n', 'utf8'))
     .catch(() => {
       // Telemetry must never crash the caller. If the disk is full or perms

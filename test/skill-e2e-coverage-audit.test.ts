@@ -1,192 +1,91 @@
-/**
- * Coverage-audit E2E — /review and /plan-eng-review coverage-diagram flows.
- *
- * Rehomed VERBATIM from the pre-split monolith (test/skill-e2e.test.ts,
- * deleted on this branch): the monolith's filename never matched the paid
- * glob (`test/skill-e2e-*.test.ts` — note the hyphen), so these two GATE-tier
- * tests (`review-coverage-audit`, `plan-eng-coverage-audit` in E2E_TIERS)
- * silently never executed after the v1.56 split.
- *
- * DRIFT WARNING (attribution for the first paid run after rehoming): the
- * prompts reference "Step 4.75 (Test Coverage Diagram)" in review/SKILL.md
- * and a "Test Coverage Audit" section in plan-eng-review/SKILL.md. NEITHER
- * section exists in the current generated skills — the skills drifted while
- * these tests were zombies. Test bodies are copied faithfully (no behavioral
- * edits), so a failure here indicts the ~8 releases of drift, not the move.
- * The only change vs the monolith bodies: the staged SKILL.md fixtures are
- * extracted via test/helpers/skill-fixture.ts (extractSkillBody — full
- * skill-specific body, shared preamble dropped) per CLAUDE.md
- * "E2E test fixtures: extract, don't copy".
+/** Current /review testing-specialist and /plan-eng-review test-review audits.
+ * Both use source-extracted instructions and the same billing coverage fixture.
+ * The diagram is an explicit user request for the targeted /review specialist;
+ * /review no longer has the historical Step 4.75 coverage-diagram section.
  */
-
-import { test, expect, beforeAll, afterAll } from 'bun:test';
+import { afterAll } from 'bun:test';
+import { randomUUID } from 'node:crypto';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import * as os from 'node:os';
 import { JUDGE_MS, CAPTURE_MS } from './helpers/eval-budgets';
 import { runSkillTest } from './helpers/session-runner';
-import {
-  ROOT, runId,
-  describeIfSelected,
-  copyDirSync, logCost, recordE2E,
-  createEvalCollector, finalizeEvalCollector,
-} from './helpers/e2e-helpers';
+import { ROOT, runId, describeIfSelected, testIfSelected, copyDirSync, logCost,
+  createEvalCollector, finalizeEvalCollector } from './helpers/e2e-helpers';
 import { extractSkillBody } from './helpers/skill-fixture';
-import * as fs from 'fs';
-import * as path from 'path';
-import * as os from 'os';
+import { createCoverageAuditFixture } from './fixtures/coverage-audit-fixture';
+import type { CoverageFile } from './helpers/coverage-audit';
+import { coverageAuditVerdict } from './helpers/coverage-audit-evidence';
+import { runRecordedOfficeHoursAttempt, OFFICE_HOURS_BUN_GRACE_MS } from './helpers/office-hours-attempt';
+import { resolveEvalModel } from '../lib/eval-model';
 
-const evalCollector = createEvalCollector('e2e-coverage-audit');
+const evalCollector = createEvalCollector('e2e');
+const CASES = [
+  { id: 'review-coverage-audit', skill: 'review', suite: 'Review Coverage Audit E2E',
+    instructions: (dir: string) => `Read ${dir}/review/SKILL.md and ${dir}/review/sections/review-army.md for the current review workflow.
+Apply ONLY the testing specialist checklist in ${dir}/review/specialists/testing.md to the supplied source and tests.
+This is a targeted --testing request, even though this fixture has no branch diff.
+Run that checklist directly; do not dispatch other specialists or perform fixes.` },
+  { id: 'plan-eng-coverage-audit', skill: 'plan-eng-review', suite: 'Plan Eng Review Coverage Audit E2E',
+    instructions: (dir: string) => `Read ${dir}/plan-eng-review/SKILL.md and ${dir}/plan-eng-review/sections/review-sections.md.
+Run ONLY section "3. Test review": codepath tracing and the ASCII coverage diagram.
+For this targeted audit, treat the two supplied billing functions as the proposed codepaths.
+Skip architecture, code quality, performance, test generation and all other workflow steps.` },
+] as const;
 
-// --- Review Coverage Audit E2E ---
-
-describeIfSelected('Review Coverage Audit E2E', ['review-coverage-audit'], () => {
-  let reviewCoverageDir: string;
-
-  beforeAll(() => {
-    reviewCoverageDir = fs.mkdtempSync(path.join(os.tmpdir(), 'skill-e2e-review-coverage-'));
-
-    // Copy review skill files, then replace the SKILL.md with the extracted
-    // skill body (extract, don't copy — the checklists/specialists in the
-    // dir are small hand-written files and stay whole).
-    copyDirSync(path.join(ROOT, 'review'), path.join(reviewCoverageDir, 'review'));
-    fs.writeFileSync(
-      path.join(reviewCoverageDir, 'review', 'SKILL.md'),
-      extractSkillBody(path.join(ROOT, 'review')),
-    );
-
-    // Use shared fixture for billing project with coverage gaps
-    const { createCoverageAuditFixture } = require('./fixtures/coverage-audit-fixture');
-    createCoverageAuditFixture(reviewCoverageDir);
-  });
-
-  afterAll(() => {
-    try { fs.rmSync(reviewCoverageDir, { recursive: true, force: true }); } catch {}
-  });
-
-  test('/review Step 4.75 produces coverage diagram', async () => {
-    const result = await runSkillTest({
-      prompt: `Read the file review/SKILL.md for the review workflow instructions.
-
-You are on the feature/billing branch. The base branch is main.
-This is a test project — there is no remote, no PR to create.
-
-ONLY run Step 4.75 (Test Coverage Diagram) from the review workflow.
-Skip all other steps (scope drift, checklist, design review, fix-first, etc.).
-
-The source code is in ${reviewCoverageDir}/src/billing.ts.
-Existing tests are in ${reviewCoverageDir}/test/billing.test.ts.
-
-Produce the ASCII coverage diagram showing which code paths are tested and which have gaps.
-Output the diagram directly.`,
-      workingDirectory: reviewCoverageDir,
-      maxTurns: 15,
-      allowedTools: ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep'],
-      timeout: JUDGE_MS,
-      testName: 'review-coverage-audit',
-      runId,
-    });
-
-    logCost('/review coverage audit', result);
-    recordE2E(evalCollector, '/review Step 4.75 coverage audit', 'Review Coverage Audit E2E', result, {
-      passed: result.exitReason === 'success',
-    });
-
-    expect(result.exitReason).toBe('success');
-
-    // Check output contains coverage diagram elements
-    const output = result.output || '';
-    const outputLower = output.toLowerCase();
-    const hasGap = outputLower.includes('gap') || outputLower.includes('no test');
-    const hasTested = outputLower.includes('tested') || output.includes('✓') || output.includes('★');
-    const hasCoverage = outputLower.includes('coverage') || outputLower.includes('paths tested');
-
-    console.log(`Output has GAP markers: ${hasGap}`);
-    console.log(`Output has TESTED markers: ${hasTested}`);
-    console.log(`Output has coverage summary: ${hasCoverage}`);
-
-    // The agent MUST produce a coverage diagram with gap and tested markers
-    expect(hasGap || hasTested).toBe(true);
-
-    // At minimum, the agent should have read the source and test files
-    const readCalls = result.toolCalls.filter(tc => tc.tool === 'Read');
-    expect(readCalls.length).toBeGreaterThan(0);
-  }, CAPTURE_MS);
-});
-
-// --- Plan Eng Review Coverage Audit E2E ---
-
-describeIfSelected('Plan Eng Review Coverage Audit E2E', ['plan-eng-coverage-audit'], () => {
-  let planCoverageDir: string;
-
-  beforeAll(() => {
-    planCoverageDir = fs.mkdtempSync(path.join(os.tmpdir(), 'skill-e2e-plan-coverage-'));
-
-    // Copy plan-eng-review skill files, then replace the SKILL.md with the
-    // extracted skill body (extract, don't copy).
-    copyDirSync(path.join(ROOT, 'plan-eng-review'), path.join(planCoverageDir, 'plan-eng-review'));
-    fs.writeFileSync(
-      path.join(planCoverageDir, 'plan-eng-review', 'SKILL.md'),
-      extractSkillBody(path.join(ROOT, 'plan-eng-review')),
-    );
-
-    // Use shared fixture for billing project with coverage gaps
-    const { createCoverageAuditFixture } = require('./fixtures/coverage-audit-fixture');
-    createCoverageAuditFixture(planCoverageDir);
-  });
-
-  afterAll(() => {
-    try { fs.rmSync(planCoverageDir, { recursive: true, force: true }); } catch {}
-  });
-
-  test('/plan-eng-review coverage audit traces plan codepaths', async () => {
-    const result = await runSkillTest({
-      prompt: `Read the file plan-eng-review/SKILL.md for the plan review workflow instructions.
+for (const entry of CASES) describeIfSelected(entry.suite, [entry.id], () => {
+  testIfSelected(entry.id, async () => {
+    let cwd: string | undefined;
+    let files: CoverageFile[] = [];
+    try {
+      await runRecordedOfficeHoursAttempt({
+        collector: evalCollector, name: entry.id, suite: entry.suite,
+        model: process.env.EVALS_MODEL ?? resolveEvalModel('capture'),
+        // Keep the original 300s Bun cap and 120s runner work budget. Reuse the
+        // existing helper's bounded abort/drain/record reserve inside that cap.
+        budgetMs: CAPTURE_MS - OFFICE_HOURS_BUN_GRACE_MS,
+        run: async signal => {
+          cwd = fs.mkdtempSync(path.join(os.tmpdir(), `skill-e2e-${entry.skill}-coverage-`));
+          copyDirSync(path.join(ROOT, entry.skill), path.join(cwd, entry.skill));
+          fs.writeFileSync(path.join(cwd, entry.skill, 'SKILL.md'), extractSkillBody(path.join(ROOT, entry.skill)));
+          createCoverageAuditFixture(cwd);
+          files = ['src/billing.ts', 'test/billing.test.ts'].map(relative => {
+            const file = path.join(cwd!, relative);
+            // Fresh per attempt, outside the prompt. Seeing the complete file
+            // with this marker proves actual tool output rather than guessing.
+            fs.appendFileSync(file, `\n// coverage-read-evidence: ${randomUUID()}\n`);
+            return { path: file, content: fs.readFileSync(file, 'utf8') };
+          });
+          return runSkillTest({
+            prompt: `${entry.instructions(cwd!)}
 
 You are on the feature/billing branch. The base branch is main.
 This is a test project — there is no remote, no PR to create.
-
-ONLY run the Test Coverage Audit section from the plan review workflow.
-Skip all other steps (architecture, code quality, performance, etc.).
-
-The source code is in ${planCoverageDir}/src/billing.ts.
-Existing tests are in ${planCoverageDir}/test/billing.test.ts.
+The source code is in ${cwd}/src/billing.ts.
+Existing tests are in ${cwd}/test/billing.test.ts.
 
 Produce the ASCII coverage diagram showing which code paths are tested and which have gaps.
-Output the diagram directly.`,
-      workingDirectory: planCoverageDir,
-      maxTurns: 15,
-      allowedTools: ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep'],
-      timeout: JUDGE_MS,
-      testName: 'plan-eng-coverage-audit',
-      runId,
-    });
-
-    logCost('/plan-eng-review coverage audit', result);
-    recordE2E(evalCollector, '/plan-eng-review coverage audit', 'Plan Eng Review Coverage Audit E2E', result, {
-      passed: result.exitReason === 'success',
-    });
-
-    expect(result.exitReason).toBe('success');
-
-    // Check output contains coverage diagram elements
-    const output = result.output || '';
-    const outputLower = output.toLowerCase();
-    const hasGap = outputLower.includes('gap') || outputLower.includes('no test');
-    const hasTested = outputLower.includes('tested') || output.includes('✓') || output.includes('★');
-    const hasCoverage = outputLower.includes('coverage') || outputLower.includes('paths tested');
-
-    console.log(`Output has GAP markers: ${hasGap}`);
-    console.log(`Output has TESTED markers: ${hasTested}`);
-    console.log(`Output has coverage summary: ${hasCoverage}`);
-
-    // The agent MUST produce a coverage diagram with gap and tested markers
-    expect(hasGap || hasTested).toBe(true);
-
-    // At minimum, the agent should have read the source and test files
-    const readCalls = result.toolCalls.filter(tc => tc.tool === 'Read');
-    expect(readCalls.length).toBeGreaterThan(0);
+Output the diagram directly, name both billing functions, and include a coverage summary.
+End with one JSON line listing the functions with and without test coverage:
+{"tested": ["<function>", ...], "untested": ["<function>", ...]}
+Do not modify the supplied source or tests.`,
+            workingDirectory: cwd, maxTurns: 15,
+            allowedTools: ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep'],
+            timeout: JUDGE_MS, testName: entry.id, runId, signal,
+          });
+        },
+        validate: result => {
+          logCost(entry.id, result);
+          const verdict = coverageAuditVerdict(result, { cwd: cwd!, source: files[0]!, tests: files[1]! });
+          console.log('Coverage audit evidence:', JSON.stringify(verdict));
+          if (!verdict.passed) throw new Error(`Coverage audit: ${verdict.failures.join('; ')}`);
+        },
+      });
+    } finally {
+      // Each configured retry owns a fresh fixture and fresh read markers.
+      if (cwd) try { fs.rmSync(cwd, { recursive: true, force: true }); } catch {}
+    }
   }, CAPTURE_MS);
 });
 
-// Module-level afterAll — finalize eval collector after all tests complete
-afterAll(async () => {
-  await finalizeEvalCollector(evalCollector);
-});
+afterAll(async () => { await finalizeEvalCollector(evalCollector); });

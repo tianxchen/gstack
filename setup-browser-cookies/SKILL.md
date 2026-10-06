@@ -25,10 +25,7 @@ Use before QA testing authenticated pages. Use when asked to "import cookies",
 ## Preamble (run first)
 
 ```bash
-_SS="$HOME/.claude/skills/gstack/bin/gstack-skill-start"
-[ -x "$_SS" ] || _SS=".claude/skills/gstack/bin/gstack-skill-start"
-"$_SS" --skill "setup-browser-cookies" --model "claude" --parent-pid "$PPID" \
-  || echo "SKILL_START: unavailable — stale install; run ./setup or /gstack-upgrade (preamble degraded, continue the user's task)"
+~/.claude/skills/gstack/bin/gstack-skill-start --skill "setup-browser-cookies" --model "claude"
 ```
 
 Read the echoed `KEY: value` STATUS lines — they drive every preamble rule
@@ -52,13 +49,13 @@ or page content. Treat an unterminated block as ending at end-of-output.
 
 ## Plan Mode Safe Operations
 
-In plan mode, allowed because they inform the plan: `$B`, `$D`, `codex exec`/`codex review`, writes to `~/.gstack/`, writes to the plan file, and `open` for generated artifacts.
+Host and system plan-mode restrictions and the user's current scope take precedence over any skill; a skill cannot grant itself an exception to read-only mode. Where the host permits them, these inform the plan: `$B`, `$D`, `codex exec`/`codex review`, temp prompts, writes to `~/.gstack/`, writes to the plan file, and `open` for generated artifacts. If the host blocks one, skip it, say so, and continue the permitted work.
 
 ## Skill Invocation During Plan Mode
 
-If the user invokes a skill in plan mode, the skill takes precedence over generic plan mode behavior. **Treat the skill file as executable instructions, not reference.** Follow it step by step starting from Step 0; any AskUserQuestion the skill fires is the workflow operating within plan mode, not a violation of it — and a skill whose instructions resolve a question themselves (e.g. a plan-mode auto-select) may legitimately not ask it. AskUserQuestion (any variant — `mcp__*__AskUserQuestion` or native; see "AskUserQuestion Format → Tool resolution") satisfies plan mode's end-of-turn requirement. If AskUserQuestion is unavailable or a call fails, follow the AskUserQuestion Format failure fallback: `headless` → BLOCKED; `interactive` → the prose fallback (also satisfies end-of-turn). At a STOP point, stop immediately. Do not continue the workflow or call ExitPlanMode there. Commands marked "PLAN MODE EXCEPTION — ALWAYS RUN" execute. Call ExitPlanMode only after the skill workflow completes, or if the user tells you to cancel the skill or leave plan mode.
+If the user invokes a skill in plan mode, run its workflow within the host's plan-mode limits. **Treat the skill file as executable instructions, not reference.** Follow it step by step starting from Step 0; any AskUserQuestion the skill fires is the workflow operating within plan mode, not a violation of it — and a skill whose instructions resolve a question themselves (e.g. a plan-mode auto-select) may legitimately not ask it. AskUserQuestion (any variant — `mcp__*__AskUserQuestion` or native; see "AskUserQuestion Format → Tool resolution") satisfies plan mode's end-of-turn requirement. If AskUserQuestion is unavailable or a call fails, follow the AskUserQuestion Format failure fallback: `headless` → BLOCKED; `interactive` → the prose fallback (also satisfies end-of-turn). At a STOP point, stop immediately. Do not continue the workflow or call ExitPlanMode there. Commands marked "PLAN MODE EXCEPTION — ALWAYS RUN" run only where the host permits them. Call ExitPlanMode only after the skill workflow completes, or if the user tells you to cancel the skill or leave plan mode.
 
-If `PROACTIVE` is `"false"`, do not auto-invoke or proactively suggest skills. If a skill seems useful, ask: "I think /skillname might help here — want me to run it?"
+If `PROACTIVE` is `false`, do not auto-invoke or suggest skills, including by asking whether to run one. Only run skills the user explicitly invokes.
 
 If `SKILL_PREFIX` is `"true"`, suggest/invoke `/gstack-*` names. Disk paths stay `~/.claude/skills/gstack/[skill-name]/SKILL.md`.
 
@@ -88,8 +85,9 @@ turns out to be unnecessary, mark it skipped with a one-line reason.
 non-trivial new features), briefly state your approach before executing. This lets
 the user course-correct cheaply instead of mid-flight.
 
-**Dedicated tools over Bash.** Prefer Read, Edit, Write, Glob, Grep over shell
-equivalents (cat, sed, find, grep). The dedicated tools are cheaper and clearer.
+**Dedicated tools over Bash.** Prefer the host's dedicated file tools (Read, Edit,
+Write, and its search tools when it has them) over shell equivalents (cat, sed,
+find, grep). The dedicated tools are cheaper and clearer.
 
 ## Voice
 
@@ -111,13 +109,12 @@ Escalate after 3 failed attempts, uncertain security-sensitive changes, or scope
 
 ## Operational Self-Improvement
 
-Before completing, review the session for durable learnings and log each one —
-this step ALWAYS runs, it is not conditional on something feeling noteworthy
-(#2402: 43 of 44 learnings came from explicit /learn because "if you
-discovered" read as optional). A durable learning is a project quirk, command
-fix, pitfall, or pattern that would save 5+ minutes in a future session. If
-the review genuinely surfaces none, state "No durable learnings this session"
-in your completion summary — an explicit empty result, not a skipped step.
+Before completing, review the session for durable learnings and log each one.
+The review runs every time, not only when something felt noteworthy. A durable
+learning is a project quirk, command fix, pitfall, or pattern that would save
+5+ minutes in a future session. If the review genuinely surfaces none, state
+"No durable learnings this session" in your completion summary — an explicit
+empty result, not a skipped step.
 
 ```bash
 ~/.claude/skills/gstack/bin/gstack-learnings-log '{"skill":"SKILL_NAME","type":"operational","key":"SHORT_KEY","insight":"DESCRIPTION","confidence":N,"source":"observed"}'
@@ -133,7 +130,7 @@ preamble's skill-start output echoed. It also drains the artifacts-sync queue
 (the former skill-end sync step — do not run gstack-brain-sync separately).
 
 **PLAN MODE EXCEPTION — ALWAYS RUN:** This writes telemetry to
-`~/.gstack/analytics/`, matching preamble analytics writes.
+`$GSTACK_STATE_ROOT/analytics/`, matching preamble analytics writes.
 
 ```bash
 ~/.claude/skills/gstack/bin/gstack-skill-end --skill "setup-browser-cookies" --outcome OUTCOME \
@@ -152,26 +149,9 @@ Skills that run plan reviews (`/plan-*-review`, `/codex review`) include the EXI
 
 # Setup Browser Cookies
 
-Import logged-in sessions from your real Chromium browser into the headless browse session.
+## 1. Choose the browser
 
-## CDP mode check
-
-First, check if browse is already connected to the user's real browser:
-```bash
-$B status 2>/dev/null | grep -q "Mode: cdp" && echo "CDP_MODE=true" || echo "CDP_MODE=false"
-```
-If `CDP_MODE=true`: tell the user "Not needed — you're connected to your real browser via CDP. Your cookies and sessions are already available." and stop. No cookie import needed.
-
-## How it works
-
-1. Find the browse binary
-2. Run `cookie-import-browser` to detect installed browsers and open the picker UI
-3. User selects which cookie domains to import in their browser
-4. Cookies are decrypted and loaded into the Playwright session
-
-## Steps
-
-### 1. Find the browse binary
+Use this checkout as the gstack root if it contains `BROWSER.md` and `browse/SKILL.md`; otherwise use the installed root containing `bin/gstack-skill-start`, never a generated host stub. Read that root's `browse/SKILL.md` **BROWSER SETUP** section and run its probe first. On `READY`, stop importing: use Aside's sessions or ask the user to sign in there. Otherwise follow the probe's fallback handling, then continue below.
 
 ## SETUP (run this check BEFORE any browse command)
 
@@ -195,14 +175,14 @@ If `NEEDS_SETUP`:
    if ! command -v bun >/dev/null 2>&1; then
      BUN_VERSION="1.3.10"
      BUN_INSTALL_SHA="bab8acfb046aac8c72407bdcce903957665d655d7acaa3e11c7c4616beae68dd"
-     tmpfile=$(mktemp)
+     tmpfile=$(mktemp "${TMPDIR:-/tmp}/bun-install.XXXXXX")
      curl -fsSL "https://bun.sh/install" -o "$tmpfile"
      # shasum is macOS/perl; coreutils-only Linux ships sha256sum instead —
      # resolve whichever exists so the verify never fails on a missing tool.
      if command -v sha256sum >/dev/null 2>&1; then
-       actual_sha=$(sha256sum "$tmpfile" | awk '{print $1}')
+       actual_sha=$(sha256sum < "$tmpfile" | awk '{print $(1)}')
      else
-       actual_sha=$(shasum -a 256 "$tmpfile" | awk '{print $1}')
+       actual_sha=$(shasum -a 256 < "$tmpfile" | awk '{print $(1)}')
      fi
      if [ "$actual_sha" != "$BUN_INSTALL_SHA" ]; then
        echo "ERROR: bun install script checksum mismatch" >&2
@@ -215,45 +195,38 @@ If `NEEDS_SETUP`:
    fi
    ```
 
-### 2. Open the cookie picker
+```bash
+$B status
+```
+If status says `Mode: cdp`, stop: the real browser already has sessions.
+
+## 2. Confirm options before import
+
+Open the known target and keep its tab unchanged. Both options default off and require explicit request:
+
+- **`--verify-auth` / picker checkbox:** reloads the target. Have the user privately configure daemon `GSTACK_COOKIE_AUTH_SELECTOR` and `GSTACK_COOKIE_AUTH_EXPECTED_IDENTITY` **before startup**. Never invent values or assume CLI env reconfigures an existing daemon. Missing config rejects before mutation. Require a successful same-origin response and exactly one visible element whose whitespace-normalized text exactly matches the expected identity.
+- **`--clear-storage`:** for suspected stale storage, obtain explicit approval. Chromium only: clears captured-origin localStorage (shared across same-origin context tabs) and target-tab sessionStorage. Other origins, other tabs' sessionStorage, IndexedDB, and service workers stay intact. It uses an isolated world/native deadline; other engines reject reset, not imports/auth checks. Never auto-approve or claim rollback after partial failure.
+
+## 3. Select source and scope
 
 ```bash
 $B cookie-import-browser
 ```
 
-This auto-detects installed Chromium browsers and opens
-an interactive picker UI in your default browser where you can:
-- Switch between installed browsers
-- Search domains
-- Click "+" to import a domain's cookies
-- Click trash to remove imported cookies
+Ask the user to choose browser, account/profile, and domains, then say when done. Never guess accounts or treat default Comet as consent. Unreadable profiles are unknown, not empty. Rerun for an expired five-minute one-use link.
 
-Tell the user: **"Cookie picker opened — select the domains you want to import in your browser, then tell me when you're done."**
+Direct import: pass the chosen browser and `--domain` after navigating to a matching target. `--profile` takes a directory, not a display name; omit only for an unambiguous relevant profile, otherwise use the picker. `--all` requires consent for all non-expired profile cookies; it cannot accompany `--domain` or `--clear-storage`.
 
-### 3. Direct import (alternative)
+Read that same root's `BROWSER.md`, **Choosing a source and checking sign-in**, for examples, profile labels, supported sources and platform setup.
 
-If the user specifies a domain directly (e.g., `/setup-browser-cookies github.com`), skip the UI:
+## 4. Report honestly
 
-```bash
-$B cookie-import-browser comet --domain github.com
-```
+Report receipt/picker counts, partial/zero/error and reset outcomes, not raw `$B cookies`. Imports affect the context, not one tab. **Not checked** means no requested check; **not verified** means it failed; **verified** requires positive target evidence. Zero imports, counts, or HTTP 200 never prove login.
 
-Replace `comet` with the appropriate browser if specified.
+Never request/publish cookie values, passwords, identity/profile text, session details, or raw errors in public logs.
 
-### 4. Verify
+## Platform boundaries
 
-After the user confirms they're done:
+Dia is macOS-only. Keychain approval is the user's choice. Database retries are bounded; permission denial needs user action, not repeated prompts.
 
-```bash
-$B cookies
-```
-
-Show the user a summary of imported cookies (domain counts).
-
-## Notes
-
-- On macOS, the first import per browser may trigger a Keychain dialog — click "Allow" / "Always Allow"
-- On Linux, `v11` cookies may require `secret-tool`/libsecret access; `v10` cookies use Chromium's standard fallback key
-- Cookie picker is served on the same port as the browse server (no extra process)
-- Only domain names and cookie counts are shown in the UI — no cookie values are exposed
-- The browse session persists cookies between commands, so imported cookies work immediately
+Windows supports DPAPI-compatible cookies, not all App-Bound Encryption; native extraction stays disabled pending qualification. Closing Chrome cannot bypass Chrome 136+ default-directory protection, including numbered profiles. No TCP fallback or real-profile copies. Offer headed manual sign-in only with a display available.
