@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Reconcile the upstream gstack branch in a separate worktree, then activate
 # the exact revision the operator tested. This never resets or stashes work.
+BASH_COMPAT=50
 set -euo pipefail
 
 usage() {
@@ -33,6 +34,7 @@ if [[ "$ACTION" == apply ]]; then
 fi
 
 SCRIPT_DIR=$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+. "$SCRIPT_DIR/gstack-egress-lib.sh"
 REPO=${GSTACK_INTEGRATION_REPO:-"$SCRIPT_DIR/.."}
 WORKTREE=${GSTACK_INTEGRATION_WORKTREE:-}
 BRANCH=${GSTACK_INTEGRATION_BRANCH:-codex/gstack-integration}
@@ -93,8 +95,14 @@ clean_worktree() {
 }
 
 if [[ "$ACTION" == prepare ]]; then
-  printf 'Fetching %s/main from %s\n' "$UPSTREAM" "$(git -C "$REPO" remote get-url "$UPSTREAM")"
-  GIT_TERMINAL_PROMPT=0 git -C "$REPO" fetch "$UPSTREAM" main
+  UPSTREAM_URL=$(git -C "$REPO" remote get-url "$UPSTREAM")
+  UPSTREAM_HOST=${UPSTREAM_URL#*://}
+  UPSTREAM_HOST=${UPSTREAM_HOST#*@}
+  UPSTREAM_HOST=${UPSTREAM_HOST%%[/:]*}
+  printf 'Fetching %s/main from %s\n' "$UPSTREAM" "${UPSTREAM_HOST:-local}"
+  GIT_TERMINAL_PROMPT=0 _receipted_git open upstream-integration "${UPSTREAM_HOST:-local}" \
+    gstack-upstream-fetch 'user ran gstack-integrate-upstream prepare' \
+    git -C "$REPO" fetch "$UPSTREAM" main
   if [[ -e "$WORKTREE" ]]; then
     check_worktree
     clean_worktree "$WORKTREE"
@@ -137,7 +145,7 @@ else
   printf 'Upstream:    %s (%s/main)\n' "$(git -C "$REPO" rev-parse "$UPSTREAM/main")" "$UPSTREAM"
   if [[ "$ACTION" == prepare ]]; then
     printf '\nTest the integration worktree, then apply its full commit ID:\n'
-    printf '  cd %q && bun install --frozen-lockfile && bun run typecheck && bun run test\n' "$WORKTREE"
+    printf '  cd %q && bun install --frozen-lockfile && bun run build && bun run typecheck && bun run test\n' "$WORKTREE"
     printf '  %q apply %s\n' "$0" "$(git -C "$WORKTREE" rev-parse HEAD)"
   fi
 fi

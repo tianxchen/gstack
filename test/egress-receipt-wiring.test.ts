@@ -67,6 +67,7 @@ const POLARITY: Record<string, 'fail-closed' | 'fail-open'> = {
   'security-dashboard': 'fail-open',
   'community-dashboard': 'fail-open',
   'git-class user ops (artifacts-init, brain-restore, session-update)': 'fail-open',
+  'upstream-integration': 'fail-open',
   'context-bill --exact': 'fail-open',
 };
 
@@ -108,6 +109,7 @@ const SHELL_SINKS = [
   'bin/gstack-artifacts-init',
   'bin/gstack-brain-restore',
   'bin/gstack-session-update',
+  'bin/gstack-integrate-upstream',
 ];
 
 /** design files that talk to api.openai.com — all must use receiptedFetch. */
@@ -356,6 +358,7 @@ describe('egress receipt wiring tripwire', () => {
       'git-class user ops (artifacts-init, brain-restore, session-update)',
       'security-dashboard',
       'update-check',
+      'upstream-integration',
     ]);
   });
 

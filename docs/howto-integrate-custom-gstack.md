@@ -26,6 +26,7 @@ run with an older version does not qualify the merge. For example:
 ```bash
 cd ../gstack-integration
 bun install --frozen-lockfile
+bun run build
 bun run typecheck
 bun run test
 cd ../gstack

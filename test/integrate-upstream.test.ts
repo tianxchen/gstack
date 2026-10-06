@@ -10,12 +10,13 @@ afterEach(() => {
   for (const fixture of fixtures.splice(0)) rmSync(fixture, { recursive: true, force: true });
 });
 
-function run(command: string, args: string[], cwd?: string) {
+function run(command: string, args: string[], cwd?: string, extraEnv: Record<string, string> = {}) {
   const result = Bun.spawnSync([command, ...args], {
     cwd,
-    env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+    env: { ...process.env, GIT_TERMINAL_PROMPT: '0', ...extraEnv },
     stdout: 'pipe',
     stderr: 'pipe',
+    timeout: 30_000,
   });
   return {
     code: result.exitCode,
@@ -55,7 +56,8 @@ function fixture() {
 }
 
 function call(main: string, integration: string, action: string, sha?: string) {
-  return run('bash', [script, action, ...(sha ? [sha] : []), '--repo', main, '--worktree', integration]);
+  return run('bash', [script, action, ...(sha ? [sha] : []), '--repo', main, '--worktree', integration], undefined,
+    { GSTACK_HOME: join(main, '..', 'gstack-state') });
 }
 
 test('prepare preserves local commits; apply advances main only for the tested SHA and refreshes both hosts', () => {
@@ -70,7 +72,9 @@ test('prepare preserves local commits; apply advances main only for the tested S
 
   const prepared = call(main, integration, 'prepare');
   expect(prepared.code).toBe(0);
-  expect(prepared.out).toContain('bun install --frozen-lockfile && bun run typecheck');
+  expect(prepared.out).toContain('bun install --frozen-lockfile && bun run build && bun run typecheck');
+  expect(readFileSync(join(main, '..', 'gstack-state', 'security', 'egress.jsonl'), 'utf8'))
+    .toContain('"sink":"upstream-integration"');
   expect(git(main, 'rev-parse', 'HEAD')).toBe(oldMain);
   expect(readFileSync(join(integration, 'local.txt'), 'utf8')).toBe('customized\n');
   expect(readFileSync(join(integration, 'upstream.txt'), 'utf8')).toBe('new upstream feature\n');
