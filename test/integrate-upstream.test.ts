@@ -365,6 +365,73 @@ test("validation and apply refuse a held workflow lock", () => {
   expect(existsSync(join(main, "setup-calls"))).toBe(false);
 });
 
+test("validation isolates HOME and dependencies without overriding per-test state roots", () => {
+  const { main, integration } = fixture();
+  expect(call(main, integration, "prepare").code).toBe(0);
+  mkdirSync(join(main, "node_modules/operator-only-package"), {
+    recursive: true,
+  });
+  writeFileSync(
+    join(main, "node_modules/operator-only-package/index.js"),
+    "module.exports = true;",
+  );
+  writeFileSync(
+    join(integration, "audit-environment.cjs"),
+    `
+    const fs = require('fs'), path = require('path');
+    for (const key of ['GSTACK_HOME', 'CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'DOCKER_CONFIG', 'DOCKER_CONTEXT', 'DOCKER_HOST']) {
+      if (process.env[key]) throw new Error('test state was globally overridden: ' + key);
+    }
+    if (process.env.HOME.startsWith(${JSON.stringify(main)})) throw new Error('HOME is under active checkout');
+    for (let parent = process.env.HOME; ; parent = path.dirname(parent)) {
+      if (fs.existsSync(path.join(parent, '.git'))) throw new Error('HOME discovers an active Git repository');
+      if (path.dirname(parent) === parent) break;
+    }
+    let leaked = false;
+    try { require.resolve('operator-only-package'); leaked = true; } catch {}
+    if (leaked) throw new Error('live checkout supplied a missing dependency');
+    console.log('isolated environment and dependency lookup');
+  `,
+  );
+  const pkg = JSON.parse(
+    readFileSync(join(integration, "package.json"), "utf8"),
+  );
+  pkg.scripts.build = "node audit-environment.cjs";
+  writeFileSync(join(integration, "package.json"), JSON.stringify(pkg));
+  git(integration, "add", ".");
+  git(integration, "commit", "-m", "audit isolated environment");
+  const result = run(
+    "bash",
+    [
+      script,
+      "validate",
+      "--backend",
+      "native",
+      "--repo",
+      main,
+      "--worktree",
+      integration,
+    ],
+    undefined,
+    {
+      GSTACK_HOME: "/operator/state",
+      CODEX_HOME: "/operator/codex",
+      CLAUDE_CONFIG_DIR: "/operator/claude",
+      DOCKER_CONFIG: "/operator/docker",
+      DOCKER_CONTEXT: "operator",
+      DOCKER_HOST: "unix:///operator/socket",
+    },
+  );
+  expect({ code: result.code, err: result.err }).toMatchObject({ code: 0 });
+  const receipt = JSON.parse(readFileSync(record(main), "utf8"));
+  expect(
+    readFileSync(
+      receipt.results.find((r: { name: string }) => r.name === "build").log,
+      "utf8",
+    ),
+  ).toContain("isolated environment and dependency lookup");
+});
+
 test("a new candidate commit needs new validation, even if an earlier candidate passed", () => {
   const { main, integration } = fixture();
   expect(call(main, integration, "prepare").code).toBe(0);

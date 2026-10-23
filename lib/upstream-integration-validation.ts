@@ -148,20 +148,9 @@ function environment(home: string): NodeJS.ProcessEnv {
   );
   return {
     ...env,
+    PATH: `${path.dirname(process.execPath)}${path.delimiter}${env.PATH ?? ""}`,
     HOME: home,
-    GSTACK_HOME: path.join(home, ".gstack"),
-    CODEX_HOME: path.join(home, ".codex"),
-    CLAUDE_CONFIG_DIR: path.join(home, ".claude"),
-    GSTACK_STRICT_BUILD: "1",
-    GIT_AUTHOR_NAME: "gstack validation",
-    GIT_AUTHOR_EMAIL: "validation@gstack.test",
-    GIT_COMMITTER_NAME: "gstack validation",
-    GIT_COMMITTER_EMAIL: "validation@gstack.test",
-    GIT_CONFIG_COUNT: "1",
-    GIT_CONFIG_KEY_0: "init.defaultBranch",
-    GIT_CONFIG_VALUE_0: "main",
     GIT_TERMINAL_PROMPT: "0",
-    GSTACK_CSO_MACOS_TESTS: process.platform === "darwin" ? "1" : "0",
   };
 }
 async function execute(
@@ -176,12 +165,26 @@ async function execute(
   let exit: number;
   try {
     exit = await new Promise<number>((resolve, reject) => {
-      const child = spawn(stage.command[0], stage.command.slice(1), {
-        cwd,
-        env,
-        stdio: ["ignore", fd, fd],
-        detached: process.platform !== "win32",
-      });
+      const child = spawn(
+        stage.command[0] === "bun" ? process.execPath : stage.command[0],
+        stage.command.slice(1),
+        {
+          cwd,
+          env: {
+            ...env,
+            ...(stage.name === "build" ? { GSTACK_STRICT_BUILD: "1" } : {}),
+            ...(stage.name === "full-free-suite"
+              ? { GSTACK_EXPECT_BINARIES: "1" }
+              : {}),
+            ...(process.platform === "darwin" &&
+            ["macos-launcher", "full-free-suite"].includes(stage.name)
+              ? { GSTACK_CSO_MACOS_TESTS: "1" }
+              : {}),
+          },
+          stdio: ["ignore", fd, fd],
+          detached: process.platform !== "win32",
+        },
+      );
       let expired = false;
       const stop = () => {
         try {
@@ -263,7 +266,7 @@ function checkBun(root: string): string {
   const required = JSON.parse(
     fs.readFileSync(path.join(root, "package.json"), "utf8"),
   ).engines?.bun;
-  const r = spawnSync("bun", ["--version"], {
+  const r = spawnSync(process.execPath, ["--version"], {
     encoding: "utf8",
     timeout: 10_000,
   });
@@ -452,6 +455,9 @@ async function dockerValidation(
             "--name",
             container,
             "--shm-size=2g",
+            "--cpus=4",
+            "--security-opt",
+            "seccomp=unconfined",
             "--user",
             `${process.getuid?.() ?? 1000}:${process.getgid?.() ?? 1000}`,
             "--mount",
@@ -461,7 +467,7 @@ async function dockerValidation(
             tag,
             "bash",
             "-c",
-            'git clone -q /input/source.bundle /tmp/gstack && cd /tmp/gstack && git checkout -q --detach "$1" && bun --no-env-file --config=/dev/null lib/upstream-integration-validation.ts linux-worker "$1" "$2"',
+            'git clone -q /input/source.bundle /workspace/gstack && cd /workspace/gstack && git checkout -q --detach "$1" && bun --no-env-file --config=/dev/null lib/upstream-integration-validation.ts linux-worker "$1" "$2"',
             "gstack-validation",
             receipt.identity.commit,
             receipt.identity.upstream,
@@ -519,8 +525,6 @@ async function linuxWorker(commit: string, upstream: string): Promise<void> {
   const env = {
     ...environment(home),
     PLAYWRIGHT_BROWSERS_PATH: "/opt/gstack-playwright",
-    GSTACK_CHROMIUM_NO_SANDBOX: "1",
-    GSTACK_EXPECT_BINARIES: "1",
   };
   const results: Result[] = [];
   try {

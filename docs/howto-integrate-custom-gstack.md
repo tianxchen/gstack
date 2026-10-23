@@ -41,9 +41,17 @@ it is not a way to skip the Linux-only test failures.
 Docker must be running. The first validation builds a Linux image with Bun,
 Node, Chromium, Xvfb, and the gate tools. Docker receives a committed Git bundle
 and an owned output directory. It does not mount the operator's home, source
-checkout, credentials, or Docker socket. Chromium runs without its sandbox
-inside this disposable container; the active macOS browser keeps its normal
-settings.
+checkout, credentials, or Docker socket. Its seccomp setting permits user
+namespaces so Chromium keeps its own sandbox. It has no extra capabilities or
+host directories beyond those two inputs. Four CPUs bound its load while the
+complete suite still runs. Node and Bun have separate tool directories, and
+the source clone is outside the system temporary root, matching the suite's
+path and fixture assumptions.
+
+Only `HOME` is redirected for the test processes. Do not inject a shared
+`GSTACK_HOME`, `CODEX_HOME`, or `CLAUDE_CONFIG_DIR`: tests create their own
+isolated state and change HOME as needed. Docker configuration is passed only
+to the host Docker client, never to test processes.
 
 Records and full stage logs are stored under the repository's common Git
 directory, in `upstream-integration-validation/`. Each record binds the candidate
