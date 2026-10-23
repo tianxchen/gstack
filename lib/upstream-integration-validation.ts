@@ -138,12 +138,14 @@ function environment(home: string): NodeJS.ProcessEnv {
     "LANG",
     "LC_ALL",
     "DISPLAY",
-    "DOCKER_HOST",
-    "DOCKER_CONTEXT",
-    "DOCKER_CONFIG",
   ]) {
     if (process.env[key]) env[key] = process.env[key];
   }
+  fs.writeFileSync(
+    path.join(home, ".gitconfig"),
+    "[user]\n\tname = gstack validation\n\temail = validation@gstack.test\n[init]\n\tdefaultBranch = main\n",
+    { mode: 0o600 },
+  );
   return {
     ...env,
     HOME: home,
@@ -389,6 +391,12 @@ async function dockerValidation(
 ): Promise<void> {
   const dockerEnv = {
     ...env,
+    ...(process.env.DOCKER_HOST
+      ? { DOCKER_HOST: process.env.DOCKER_HOST }
+      : {}),
+    ...(process.env.DOCKER_CONTEXT
+      ? { DOCKER_CONTEXT: process.env.DOCKER_CONTEXT }
+      : {}),
     DOCKER_CONFIG:
       process.env.DOCKER_CONFIG ?? path.join(process.env.HOME!, ".docker"),
   };
@@ -607,11 +615,11 @@ async function validate(
     isolated = isolatedDirectory();
     const source = path.join(isolated, "native");
     snapshot(bundle, source, before.commit, before.upstream);
-    const home = path.join(run, "home");
+    const home = path.join(isolated, "home");
     fs.mkdirSync(home, { mode: 0o700 });
     const env = {
       ...environment(home),
-      PLAYWRIGHT_BROWSERS_PATH: path.join(run, "browsers"),
+      PLAYWRIGHT_BROWSERS_PATH: path.join(isolated, "browsers"),
     };
     await runStages(
       [
@@ -642,14 +650,28 @@ async function validate(
     receipt.error = (error as Error).message;
     throw error;
   } finally {
+    let cleanupError: Error | undefined;
     if (isolated) {
-      preserveSuiteLogs(path.join(isolated, "native"), run);
-      fs.rmSync(isolated, { recursive: true, force: true });
+      try {
+        preserveSuiteLogs(path.join(isolated, "native"), run);
+      } catch (error) {
+        cleanupError = error as Error;
+      }
+      try {
+        fs.rmSync(isolated, { recursive: true, force: true });
+      } catch (error) {
+        cleanupError ??= error as Error;
+      }
+    }
+    if (cleanupError) {
+      receipt.status = "failed";
+      receipt.error = `Validation cleanup failed: ${cleanupError.message}`;
     }
     receipt.finishedAt = new Date().toISOString();
     atomicJson(path.join(run, "receipt.json"), receipt);
     atomicJson(receiptPath(repo), receipt);
     console.log(`Validation ${receipt.status}: ${receiptPath(repo)}`);
+    if (cleanupError) throw cleanupError;
   }
 }
 
