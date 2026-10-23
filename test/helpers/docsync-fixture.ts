@@ -2,51 +2,15 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { createHash } from 'node:crypto';
-import { spawnSync } from 'node:child_process';
 import { buildSeedConfig } from './hermetic-env';
 import { getProjectEvalDir } from './eval-store';
 import type { SkillTestResult } from './session-runner';
+import { DOC_PATH, docsConfigDir, gitAt, repoSnapshot } from './docsync-repo';
+
+export { DOC_PATH, docsConfigDir, gitAt, repoSnapshot, changedFiles, docsSnapshotArgv, gitBlobId, type DocsCandidateRecord } from './docsync-repo';
 
 export const DOCSYNC_ROOT = path.resolve(import.meta.dir, '../..');
-export const DOC_PATH = 'handbook/reference/commands/widget.md.tmpl';
 export type DocsScenario = 'updated' | 'current' | 'risky' | 'store' | 'legacy';
-
-export function gitAt(repo: string, ...args: string[]): string {
-  const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8', timeout: 15000,
-    env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' } });
-  if (result.status !== 0) throw new Error(`fixture git ${args.join(' ')}: ${result.stderr}`);
-  return result.stdout.trimEnd();
-}
-
-export function repoSnapshot(repo: string) {
-  const files = gitAt(repo, 'ls-files', '-z', '--cached', '--others', '--exclude-standard').split('\0').filter(Boolean);
-  const contents: Record<string, string> = {};
-  for (const name of new Set(files)) {
-    const file = path.join(repo, name);
-    if (!fs.existsSync(file)) continue;
-    const resolved = fs.realpathSync(file);
-    if (!resolved.startsWith(fs.realpathSync(repo) + path.sep)) throw new Error(`fixture path escaped: ${name}`);
-    if (fs.statSync(file).isFile()) contents[name] = fs.readFileSync(file).toString('base64');
-  }
-  return { head: gitAt(repo, 'rev-parse', 'HEAD'), index: gitAt(repo, 'ls-files', '--stage'), contents };
-}
-
-export function changedFiles(before: ReturnType<typeof repoSnapshot>, after: ReturnType<typeof repoSnapshot>): string[] {
-  return [...new Set([...Object.keys(before.contents), ...Object.keys(after.contents)])]
-    .filter(p => before.contents[p] !== after.contents[p]).sort();
-}
-
-export function docsCandidate(repo: string, auditId: string, mode: 'edit' | 'read-only', base: string) {
-  const snapshot = repoSnapshot(repo);
-  return {
-    audit_id: auditId, mode, base_sha: base, head: snapshot.head, branch: gitAt(repo, 'branch', '--show-current'),
-    selected_paths: Object.keys(snapshot.contents).filter(p => p !== 'personal-note.txt'),
-    docs_roots: ['handbook'], generated_outputs: [], index: snapshot.index,
-    content_hashes: Object.fromEntries(Object.entries(snapshot.contents).map(([p, bytes]) =>
-      [p, createHash('sha256').update(Buffer.from(bytes, 'base64')).digest('hex')])),
-    pre_existing_dirty: gitAt(repo, 'status', '--porcelain', '-z'),
-  };
-}
 
 export function fixtureDocs(scenario: DocsScenario, generatedRoot = process.env.DOCSYNC_GENERATED_ROOT || DOCSYNC_ROOT) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ds-'));
@@ -54,9 +18,7 @@ export function fixtureDocs(scenario: DocsScenario, generatedRoot = process.env.
   const skills = path.join(home, '.claude/skills/gstack');
   fs.mkdirSync(repo);
   gitAt(repo, 'init', '-b', 'main');
-  gitAt(repo, 'config', 'user.email', 'test@test.com');
-  gitAt(repo, 'config', 'user.name', 'Test');
-  gitAt(repo, 'config', 'commit.gpgsign', 'false');
+  fs.appendFileSync(path.join(repo, '.git/config'), '[user]\n\temail = test@test.com\n\tname = Test\n[commit]\n\tgpgsign = false\n');
   fs.mkdirSync(path.join(repo, '.qa-state'));
   fs.appendFileSync(path.join(repo, '.git/info/exclude'), '\n.qa-state/\n');
   const write = (file: string, text: string) => {
@@ -113,7 +75,7 @@ export function fixtureDocs(scenario: DocsScenario, generatedRoot = process.env.
   const state = path.join(home, 'state');
   fs.mkdirSync(state);
   fs.writeFileSync(path.join(state, 'config.yaml'), 'update_check: false\n');
-  const config = path.join(home, 'cc');
+  const config = docsConfigDir(home);
   fs.mkdirSync(config);
   fs.writeFileSync(path.join(config, '.claude.json'), JSON.stringify(buildSeedConfig({
     apiKey: process.env.ANTHROPIC_API_KEY, trustedDirs: [repo],

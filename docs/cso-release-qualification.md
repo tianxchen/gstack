@@ -26,11 +26,12 @@ The dedicated Windows CI job checks startup, argument forwarding, and runtime
 injection separately from static audit and private-state support. POSIX
 watchdog execution remains unavailable there.
 
-No qualified runtime or scanner image exists yet, so contained runtime and
-scanner execution is unavailable and setup preloads nothing: the scanner
-catalog is empty while its build inputs await review, and the runtime catalog's
-profiles stay unqualified until a private evaluator, still being built, can
-qualify them.
+Both catalogs are qualified. The scanner catalog
+(`lib/cso/scanner-images/catalog.json`) lists twelve scanner images: six
+scanners, each on linux/amd64 and linux/arm64. The runtime catalog
+(`lib/cso/runtime-catalog.json`) lists ten runtime images: Node, Bun, Python,
+Rails and PostgreSQL, each on both platforms. The private evaluator qualified
+them, and `cso-runtime-promote.yml` promoted them (described below).
 
 Every successful fresh install or upgrade asks the trusted launcher to preload
 the current host platform's qualified runtime and scanner images. This is the
@@ -93,6 +94,47 @@ the same cold public-gem inputs: once with two disposable SQLite connections
 and once with two databases in a fresh staged PostgreSQL sidecar. The Rails
 fixture builds the source-platform `sqlite3` and `pg` native gems only in the
 offline execution phase.
+
+Preparation output leaves its containers through `docker cp`, which cannot read
+a tmpfs mount. The acquisition `/archives` directory and the offline `/work`
+directory are therefore Docker local volumes backed by bounded tmpfs, created
+per container with private mode, the runtime uid/gid, `nosuid`, and `nodev`
+(`/archives` is also `noexec`; `/work` must stay executable for virtualenv and
+binstub launchers). The runner inspects each container and refuses to start it
+if Docker did not preserve those options. npm's user and global configs point
+at two different empty files, because npm refuses to load one file in both
+roles. Rails application and test containers hold on `sleep` after `run-app`
+copies the source; `db:prepare` starts only once that copy has finished.
+Changes to `/opt/cso/preparation` or an image recipe need a new staging run
+before native qualification can pass.
+
+Each supervised command has a 300-second ceiling (`COMMAND_TIMEOUT_MS` in
+`lib/cso/process.ts`). Only the dependency fetch and install commands of the
+acquisition and offline preparation phases get `PREPARATION_COMMAND_TIMEOUT_MS`,
+900 seconds. A Rails lockfile that lists only the `ruby` platform compiles
+nokogiri, sqlite3 and pg offline, which takes about 385 seconds at the app
+role's 0.85 CPU share. Both ceilings are cut to the time left before the
+journey's aggregate deadline, so the longer ceiling never extends a journey.
+Helper probes, exports, application starts, `db:prepare` and project tests keep
+the 300-second ceiling. A free test in `test/cso-docker-mounts.test.ts` pins
+which calls may request the longer ceiling. The CPU share is unchanged, so
+`ISOLATION_POLICY_HASH` and the profiles bound to it are unaffected.
+
+When the in-image helper refuses to export a prepared tree, preparation fails
+with error code `PREPARED_EXPORT_REJECTED` instead of the generic
+`TOOL_FAILED`. The message carries the helper's exit status and its fixed
+reason, such as `prepared tree contains a hard-linked file`, or the filesystem
+errno and syscall. It never includes target paths. Nothing retries. Treat a
+recurrence as evidence for a defect, not as a flake to rerun.
+
+The Rails offline install runs `bundle install --jobs 1`. Ruby's
+`File.umask` getter sets the process umask to 0 for an instant, and RubyGems
+calls it for every file it extracts. With two Bundler install threads, a
+directory created by one thread during that instant comes out 0777, and the
+export refuses the tree with `prepared tree contains a publicly writable
+directory`. That refusal is correct, so the install runs on one thread rather
+than the gate being relaxed. At the app role's 0.85 CPU share the second thread
+saved no measurable time.
 
 For hashed Python requirements resolved by pip, the broker records the requested
 index URL, allowed contacted hosts, and verified wheel hash. Pip's internal
@@ -239,12 +281,19 @@ policy (`ISOLATION_POLICY_HASH`, which covers the `cso-isolation-v1` policy
 version and every limit), `preparationSha256` (a digest of every source byte
 compiled or copied into a runtime image: the import closure of the image's
 verifier and preparation helpers plus the image build context), and the
-`build-inputs.json` revision. The staging run's `reviewed-inputs` job records
+`build-inputs.json` revision. Each helper entrypoint's leading `#!` line is
+hashed as absent: it is compiled into the binary as an unused string and never
+runs inside the image. Every other byte of the helpers counts, and so does
+every byte of every other file, shebang lines included. The staging run's `reviewed-inputs` job records
 these values for its source commit as the `cso-requalification-triggers`
 artifact. The ingress downloads that artifact from the verified staging run
 into the evidence, and the promotion generator writes it into
-`promotion.requalification`. Generation refuses triggers that differ from the
-promoting checkout, so a trigger that changed between staging and promotion
+`promotion.requalification`. When a recorded `preparationSha256` differs from
+the promoting checkout's, generation re-measures it at the staged commit from
+the checkout's git history. The record must match that commit under either the
+current rule or the earlier rule that also hashed the helpers' `#!` lines, and
+the current-rule value is what gets compared and recorded. Generation refuses
+triggers that differ from the promoting checkout, so a trigger that changed between staging and promotion
 requires a new staging run. The free suite's
 [`cso-requalification.test.ts`](../test/cso-requalification.test.ts) compares
 the committed catalog's recorded triggers with the current source and fails
@@ -252,6 +301,30 @@ when any differs. A change to a trigger therefore either lands with a
 requalified catalog or withdraws the catalog's runtimes in the same pull
 request. Independently, the helper refuses to select a runtime recorded under
 another isolation policy.
+
+The daily precision gate (`dailyPrecision95` in
+[`cso-eval.ts`](../scripts/cso-eval.ts)) divides true positives by reported
+findings. Hypotheses count in neither term. A finding the evaluator marks
+`instrumentation` also counts in neither term: it targets the evaluator's
+declared fixture instrumentation, such as the canary overlay files or the egress
+probe route. The seeded issue adds one true positive per cell, however many
+times it is restated. A finding the evaluator marks `incidental` is a different
+issue that a unanimous judge panel confirmed is real in that source. It adds one
+true positive per distinct `incidentalKey` in its cell, never counts toward
+recall, and needs no seeded match. Recall still measures only the seeded issue,
+and the thresholds are unchanged.
+
+The falsely-tested gate (`zeroFalselyTestedRepairs`) counts every finding the
+producer claimed was tested that trusted evidence does not certify. A claim on
+the seeded issue is certified only by the judge's own held-out repair
+verification. A claim on an `incidental` finding is certified only when the
+evaluator replayed the helper's signed repair bundle for that finding against
+the trusted source and the replay passed: the evaluator records
+`trustedReplay: { result: "passed", replayEvidenceHash }`. A `failed` replay or a
+`missing` bundle leaves the claim falsely tested. A claim on an
+`instrumentation` finding counts in neither direction, the same way precision
+leaves it out. Neither a replay nor an instrumentation claim ever counts toward
+recall, repair or held-out rates, which need the seeded issue.
 
 The judge observes held-out attacks in one boot: a `VerificationRequest`'s
 `security` field is either one assertion or an array of up to eight assertions
@@ -271,7 +344,10 @@ any gate is measured. It never edits the committed catalog. Instead,
 into an evaluation-only catalog. Its revision is `cso-eval-<runId>-<sha12>`, it
 carries an `evaluation` record instead of `promotion`, and every runtime is an
 `evaluation_candidate` whose qualification has `kind: "evaluation"` and no
-release-gate field. Then
+release-gate field. Each runtime's `qualifiedAt` is the current time unless
+`--created-at <ISO time>` names it. An evaluation that builds one unit per
+platform must pass the same `--created-at` to every build: the scorer requires
+both platforms' producers to embed identical catalog bytes. Then
 
 ```bash
 bun run build:cso -- --evaluation-candidate <catalog.json> --output <new-directory>

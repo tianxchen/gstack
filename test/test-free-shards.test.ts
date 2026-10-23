@@ -14,10 +14,13 @@ import {
   runFreeShard,
   FreeRunReporter,
   buildRunEpilogue,
+  failureExcerpt,
   FREE_TEST_TIMEOUT_MS,
   DEFAULT_WALL_TIMEOUT_MS,
   PER_FILE_WALL_MS,
   wallTimeoutForShard,
+  recordingWallTimeoutMs,
+  parseCliOptions,
   KNOWN_WINDOWS_INCOMPATIBLE,
   TEST_ROOTS,
   TREE_MUTATING,
@@ -270,6 +273,12 @@ describe('test-free-shards: exclusive host-state phase', () => {
         expect(counts).toEqual(mode === 'retry-reader' ? [2, 1, 1] : mode === 'retry-exclusive' ? [1, 1, 2] : [1, 1, 1]);
         if (mode.startsWith('retry-')) {
           expect(output).toContain('FLAKY-PASS');
+          expect(output).toContain('      Expected: 2');
+          const [flake] = fs.readFileSync(path.join(directory, 'flakes.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+          expect(flake.file).toBe(selected[mode === 'retry-reader' ? 0 : 2]);
+          expect(flake.tests).toHaveLength(1);
+          expect(flake.tests[0].name).toBe('selected fixture');
+          expect(flake.tests[0].excerpt.slice(0, 3)).toEqual(['error: expect(received).toBe(expected)', 'Expected: 2', 'Received: 1']);
           expect(events[6]).toEqual({ file: selected[mode === 'retry-reader' ? 0 : 2], event: 'start' });
         } else if (mode === 'truncated-exclusive') {
           expect(output).toContain('flaky-retry skipped');
@@ -805,12 +814,55 @@ describe('test-free-shards: output contract (log capture, quiet console, failure
     expect(lines.some((l) => l.startsWith('[test:free] FAIL — '))).toBe(true);
   }, 30_000);
 
+  test('a test process that aborts before its summary names the in-flight file and its last output', () => {
+    const reporter = new FreeRunReporter(['test/done.test.ts', 'test/aborted.test.ts']);
+    reporter.write('::group::test/done.test.ts:\n(pass) fine\n::endgroup::\n', 'stdout');
+    reporter.write('::group::test/aborted.test.ts:\n(pass) first\n', 'stdout');
+    reporter.write('GetQueuedCompletionStatusEx: (735) ERROR_ABANDONED_WAIT_0\n', 'stderr');
+    reporter.end();
+    const lines = buildRunEpilogue('failed', reporter.report(), 16_000, '/tmp/x.log');
+    expect(lines).toContain('  ⚠ test process ended before its summary; in flight: test/aborted.test.ts');
+    expect(lines).toContain('  ⚠ last output: GetQueuedCompletionStatusEx: (735) ERROR_ABANDONED_WAIT_0');
+  });
+
   test('timeout with no observable header falls back to the buffered-parallel explanation', () => {
     const reporter = new FreeRunReporter(['test/a.test.ts', 'test/b.test.ts']);
     reporter.end();
     const lines = buildRunEpilogue('timed-out', reporter.report(), 5_000, '/tmp/x.log');
     expect(lines.some((l) => l.includes('in flight at kill: unknown'))).toBe(true);
     expect(lines.some((l) => l.includes('2 planned file(s) produced no output'))).toBe(true);
+  });
+
+  // Windows run 39448730953 attempt 1, windows-free-shard (6): the team-init PowerShell case as bun printed it.
+  test('a failure keeps the assertion bun printed before its (fail) line, and the epilogue shows it', () => {
+    const reporter = new FreeRunReporter(['test/team-init-hook-shell-neutral.test.ts']);
+    reporter.write([
+      '::group::test\\team-init-hook-shell-neutral.test.ts:',
+      '(pass) required team hook: shell-neutral registration > through the default shell: deny with exit 2 when no install resolves, {} when one does [211.85ms]',
+      'killed 1 dangling process',
+      '66 |       const denied = runner(hookEnv({ HOME: home, USERPROFILE: home }));',
+      '67 |       expect(denied.status).toBe(denyStatus);',
+      '                                 ^',
+      'error: expect(received).toBe(expected)',
+      '',
+      'Expected: 1',
+      'Received: null',
+      '',
+      '      at <anonymous> (D:\\a\\gstack\\gstack\\test\\team-init-hook-shell-neutral.test.ts:67:29)',
+      '',
+      '::error file=test\\team-init-hook-shell-neutral.test.ts,line=67,col=29,title=error: expect(received).toBe(expected)::Expected: 1',
+      '(fail) required team hook: shell-neutral registration > through PowerShell: deny with exit 2 when no install resolves, {} when one does [30108.20ms]',
+      '  ^ this test timed out after 30000ms.',
+      '',
+    ].join('\n'), 'stderr');
+    reporter.end();
+    const [failure] = reporter.report().failures;
+    expect(failure.excerpt).toEqual(['error: expect(received).toBe(expected)', 'Expected: 1', 'Received: null',
+      '      at <anonymous> (D:\\a\\gstack\\gstack\\test\\team-init-hook-shell-neutral.test.ts:67:29)']);
+    const lines = buildRunEpilogue('failed', reporter.report(), 30_000, '/tmp/x.log');
+    expect(lines).toContain('      Received: null');
+    expect(failureExcerpt(['noise', 'one', 'two', 'three'])).toEqual(['one', 'two', 'three']);
+    expect(failureExcerpt(['error: x'.padEnd(300, 'y'), ...Array.from({ length: 10 }, (_, i) => 'line ' + i)])).toHaveLength(8);
   });
 
   test('duplicate fail lines dedupe; pre-header failures are labeled unattributed', () => {
@@ -928,6 +980,11 @@ describe('test-free-shards: wall-timeout scaling', () => {
 
   test('an explicit base above the scaled value wins', () => {
     expect(wallTimeoutForShard(10, 10 * 60_000)).toBe(10 * 60_000);
+  });
+
+  test('--record-durations times each file under the one-file default unless --wall-timeout is explicit', () => {
+    expect(recordingWallTimeoutMs(parseCliOptions(['--record-durations']))).toBe(wallTimeoutForShard(1));
+    expect(recordingWallTimeoutMs(parseCliOptions(['--record-durations', '--wall-timeout', '1200']))).toBe(1_200_000);
   });
 });
 

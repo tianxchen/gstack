@@ -1,8 +1,12 @@
 import type { CsoStack } from '../../lib/cso/preparation';
+
+type RuntimeStack = Exclude<CsoStack, 'java'>;
 import { canonical, sha256 } from '../../lib/cso/contracts';
 import { ISOLATION_POLICY_HASH } from '../../lib/cso/docker';
 import {
   CSO_HELPER_ABI,
+  RUNTIME_CATALOG,
+  selectRuntime,
   type QualifiedRuntime,
   type RuntimeCatalog,
   type RuntimePlatform,
@@ -14,7 +18,7 @@ const SOURCE_COMMIT = 'b'.repeat(40);
 const WORKFLOW = 'https://github.com/garrytan/gstack/actions/runs/1';
 const DIGEST = `sha256:${'a'.repeat(64)}`;
 
-const VERSIONS: Record<CsoStack | 'postgresql', Record<string, string>> = {
+const VERSIONS: Record<RuntimeStack | 'postgresql', Record<string, string>> = {
   node: { node: '24.1.0', npm: '11.3.0', 'cso-preparation': '1.0.0' },
   bun: { bun: '1.3.10', 'cso-preparation': '1.0.0' },
   python: { python: '3.12.9', uv: '0.8.0', 'cso-preparation': '1.0.0' },
@@ -22,12 +26,12 @@ const VERSIONS: Record<CsoStack | 'postgresql', Record<string, string>> = {
   postgresql: { postgresql: '17.2' },
 };
 
-function runtimeId(stack: CsoStack | 'postgresql', platform: RuntimePlatform): string {
+function runtimeId(stack: RuntimeStack | 'postgresql', platform: RuntimePlatform): string {
   return `${stack}-qualified-test-${platform === 'linux/amd64' ? 'amd64' : 'arm64'}`;
 }
 
 export function qualifiedRuntimeFixture(
-  stack: CsoStack | 'postgresql',
+  stack: RuntimeStack | 'postgresql',
   platform: RuntimePlatform = 'linux/amd64',
 ): QualifiedRuntime {
   const arch = platform === 'linux/amd64' ? 'amd64' : 'arm64';
@@ -106,4 +110,39 @@ export function completeRuntimeCatalogFixture(
     },
     runtimes,
   };
+}
+
+/**
+ * Put a staged runtime into its stack/platform slot under the reviewed profile
+ * id, as promotion does, and re-bind the promotion evidence digest the
+ * validator recomputes from the runtime matrix.
+ */
+export function installStagedRuntime(catalog: RuntimeCatalog, runtime: QualifiedRuntime): QualifiedRuntime {
+  const index = catalog.runtimes.findIndex(item => item.stack === runtime.stack && item.platform === runtime.platform);
+  const profile = catalog.profiles.find(item => item.stack === runtime.stack && item.platform === runtime.platform);
+  if (index < 0 || !profile || !catalog.promotion) throw new Error(`Runtime catalog fixture lacks ${runtime.stack} on ${runtime.platform}`);
+  const installed = { ...runtime, id: profile.id, versions: { ...runtime.versions } };
+  catalog.runtimes[index] = installed;
+  profile.versions = { ...installed.versions };
+  catalog.promotion.evidenceDigest = `sha256:${sha256(canonical(catalog.runtimes))}`;
+  return installed;
+}
+
+/** The given catalog with its promotion removed: every reviewed profile is still awaiting a qualified image. */
+export function unqualifiedRuntimeCatalog(base: RuntimeCatalog = RUNTIME_CATALOG): RuntimeCatalog {
+  const { promotion: _promotion, ...reviewed } = base;
+  return { ...reviewed, profiles: reviewed.profiles.map(profile => ({ ...profile, versions: { ...profile.versions } })), runtimes: [] };
+}
+
+/**
+ * The fail-closed rejection replay reaches at runtime admission for a fixture
+ * bundle whose image digest no qualified catalog entry carries.
+ */
+export function replayRuntimeRejection(profile: string, platform: RuntimePlatform): { code: string; message: string } {
+  try {
+    selectRuntime(profile, platform);
+  } catch (error) {
+    return { code: 'PREREQUISITE', message: String((error as Error).message).split(':')[0] };
+  }
+  return { code: 'INCOMPATIBLE_INPUT', message: 'Qualified runtime digest does not match the bundle' };
 }
