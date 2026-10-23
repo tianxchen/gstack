@@ -413,7 +413,9 @@ async function dockerValidation(
   const bun = JSON.parse(
     fs.readFileSync(path.join(root, "package.json"), "utf8"),
   ).engines.bun.slice(2);
-  const tag = `gstack-integration-validation:${hash(fs.readFileSync(dockerfile) + playwright + bun).slice(0, 20)}`;
+  const uid = process.getuid?.() ?? 1000,
+    gid = process.getgid?.() ?? 1000;
+  const tag = `gstack-integration-validation:${hash(fs.readFileSync(dockerfile) + playwright + bun + `${uid}:${gid}`).slice(0, 20)}`;
   await runStages(
     [
       {
@@ -425,6 +427,10 @@ async function dockerValidation(
           `PLAYWRIGHT_VERSION=${playwright}`,
           "--build-arg",
           `BUN_VERSION=${bun}`,
+          "--build-arg",
+          `VALIDATION_UID=${uid}`,
+          "--build-arg",
+          `VALIDATION_GID=${gid}`,
           "-t",
           tag,
           "-f",
@@ -520,7 +526,7 @@ async function linuxWorker(commit: string, upstream: string): Promise<void> {
     throw new Error("Linux worker source changed");
   const bun = checkBun(root);
   git(root, "update-ref", "refs/remotes/origin/main", upstream);
-  const home = "/tmp/gstack-validation-home";
+  const home = "/home/gstack-validation";
   fs.mkdirSync(home, { recursive: true, mode: 0o700 });
   const env = {
     ...environment(home),

@@ -17,4 +17,14 @@ ARG PLAYWRIGHT_VERSION
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/gstack-playwright
 RUN npm exec --yes --package="playwright@${PLAYWRIGHT_VERSION}" -- playwright install --with-deps chromium \
     && chmod -R a+rwX /opt/gstack-playwright
-WORKDIR /tmp
+ARG VALIDATION_UID=1000
+ARG VALIDATION_GID=1000
+RUN if ! getent group "${VALIDATION_GID}" >/dev/null; then groupadd --gid "${VALIDATION_GID}" gstack-validation; fi \
+    && if ! getent passwd "${VALIDATION_UID}" >/dev/null; then \
+         useradd --no-log-init --uid "${VALIDATION_UID}" --gid "${VALIDATION_GID}" \
+           --home-dir /home/gstack-validation --no-create-home gstack-validation; \
+       fi \
+    && mkdir -p /home/gstack-validation \
+    && chown "${VALIDATION_UID}:${VALIDATION_GID}" /home/gstack-validation
+ENV HOME=/home/gstack-validation
+WORKDIR /workspace
