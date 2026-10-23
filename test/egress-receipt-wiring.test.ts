@@ -136,6 +136,8 @@ const DESIGN_SINKS = [
 // swept tree fails the scanner — add real sinks to the wired lists above,
 // not here.
 const SCANNER_EXEMPT: Record<string, string> = {
+  'lib/upstream-integration-validation.ts':
+    'the only git clone reads an absolute, existing local bundle file created by this validator; no Git remote transport runs. Docker and package managers download public build prerequisites without receiving installed-gstack state, credentials, or operator data',
   'bin/gstack-team-init':
     'every git clone is inside an echoed instruction string (install docs); the script executes no network ops',
   'bin/gstack-gbrain-install':

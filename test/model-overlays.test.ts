@@ -391,6 +391,8 @@ describe('model-routing-claude', () => {
     ['claude-opus-5-5', 'claude'],
     ['claude-fable-5', 'fable-5'],
     ['claude-fable-5-1', 'fable-5'],
+    ['claude-fable-5-2', 'claude'],
+    ['claude-fable-5-99', 'claude'],
   ] as Array<[string, Model]>)('%s routes to %s', (input, expected) => {
     expect(resolveModel(input)).toBe(expected);
   });

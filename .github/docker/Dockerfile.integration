@@ -1,0 +1,17 @@
+# Local Linux acceptance runner. It receives a committed bundle, never the
+# operator's home, credentials, working tree, or Docker socket.
+ARG BUN_VERSION=1.4.2
+FROM oven/bun:${BUN_VERSION} AS bun
+FROM node:22.20.0-trixie
+COPY --from=bun /usr/local/bin/bun /usr/local/bin/bun
+RUN ln -s /usr/local/bin/bun /usr/local/bin/bunx \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends git python3 python3-venv curl unzip \
+       jq bc file gcc libc6-dev poppler-utils fonts-noto-color-emoji xvfb xauth x11-utils zsh \
+    && git --no-lazy-fetch --version \
+    && rm -rf /var/lib/apt/lists/*
+ARG PLAYWRIGHT_VERSION
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/gstack-playwright
+RUN npm exec --yes --package="playwright@${PLAYWRIGHT_VERSION}" -- playwright install --with-deps chromium \
+    && chmod -R a+rX /opt/gstack-playwright
+WORKDIR /tmp

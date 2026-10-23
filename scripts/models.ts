@@ -53,10 +53,8 @@ export type Model = (typeof ALL_MODEL_NAMES)[number];
  *      with or without a date (`claude-opus-4-7-1`, `claude-sonnet-5-5`,
  *      `claude-sonnet-5-5-20261001`), falls to `claude`: a newer model should
  *      not read nudges written for an older one.
- *    - Fable is the exception: any `claude-fable-5-*` ID keeps `fable-5`
- *      while a Fable 5 point release is one of gstack's eval models (the
- *      judge, CLAUDE_JUDGE_EVAL_MODEL in lib/eval-model.ts). The exception
- *      ends when CLAUDE_JUDGE_EVAL_MODEL leaves Fable 5.
+ *    - Historical `claude-fable-5` and `claude-fable-5-1` IDs retain
+ *      the `fable-5` overlay. New point releases use the generic Claude overlay.
  *    - Any other `claude-*` (including `claude-opus-5-5`) → `claude`
  *    - `gemini-*` (2.5-pro, flash, etc.) → `gemini`
  * 3. Unknown input → returns null (caller decides: error, or fall back).
@@ -85,7 +83,7 @@ export function resolveModel(input: string): Model | null {
   if (/^o[0-9]+(-|$)/.test(s)) return 'o-series';
   const pinned = /^claude-(opus-4-7|opus-4-8|sonnet-5)(-\d{8}|-latest)?$/.exec(s);
   if (pinned) return pinned[1] as Model;
-  if (/^claude-fable-5(-|$)/.test(s)) return 'fable-5';
+  if (/^claude-fable-5(?:-1)?$/.test(s)) return 'fable-5';
   if (/^claude(-|$)/.test(s)) return 'claude';
   if (/^gemini(-|$)/.test(s)) return 'gemini';
 

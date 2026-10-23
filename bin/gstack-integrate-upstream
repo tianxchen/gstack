@@ -9,12 +9,16 @@ usage() {
 Usage:
   gstack-integrate-upstream prepare [--repo PATH] [--worktree PATH] [--branch NAME] [--upstream REMOTE]
   gstack-integrate-upstream status  [--repo PATH] [--worktree PATH] [--branch NAME] [--upstream REMOTE]
+  gstack-integrate-upstream validate [--backend native|docker] [--repo PATH] [--worktree PATH]
   gstack-integrate-upstream apply COMMIT [--repo PATH] [--worktree PATH] [--branch NAME] [--upstream REMOTE]
+  gstack-integrate-upstream apply COMMIT --check-only [--repo PATH] [--worktree PATH]
 
 prepare fetches upstream/main, then merges local main and upstream/main into an
-integration worktree. Resolve any conflict there and test that worktree.
-apply requires its exact tested commit, fast-forwards local main, and refreshes
+integration worktree. Resolve conflicts and commit, then run validate.
+validate records passing checks for the committed source (Docker on macOS).
+apply requires matching passing evidence, fast-forwards local main, and refreshes
 both Claude Code and Codex. It does not push to a remote.
+--check-only verifies readiness without changing main or refreshing either host.
 USAGE
 }
 
@@ -23,7 +27,7 @@ die() { printf 'gstack-integrate-upstream: %s\n' "$*" >&2; exit 1; }
 [[ $# -gt 0 ]] || { usage; exit 2; }
 ACTION=$1
 shift
-case "$ACTION" in prepare|status|apply) ;; -h|--help|help) usage; exit 0 ;; *) usage >&2; exit 2 ;; esac
+case "$ACTION" in prepare|status|validate|apply) ;; -h|--help|help) usage; exit 0 ;; *) usage >&2; exit 2 ;; esac
 
 TESTED_SHA=
 if [[ "$ACTION" == apply ]]; then
@@ -39,6 +43,9 @@ REPO=${GSTACK_INTEGRATION_REPO:-"$SCRIPT_DIR/.."}
 WORKTREE=${GSTACK_INTEGRATION_WORKTREE:-}
 BRANCH=${GSTACK_INTEGRATION_BRANCH:-codex/gstack-integration}
 UPSTREAM=${GSTACK_INTEGRATION_UPSTREAM:-origin}
+BACKEND=native
+[[ "$(uname -s)" != Darwin ]] || BACKEND=docker
+CHECK_ONLY=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --repo|--worktree|--branch|--upstream)
@@ -48,6 +55,15 @@ while [[ $# -gt 0 ]]; do
         --branch) BRANCH=$2 ;; --upstream) UPSTREAM=$2 ;;
       esac
       shift 2 ;;
+    --backend)
+      [[ "$ACTION" == validate && $# -ge 2 ]] || die '--backend requires validate and a value.'
+      BACKEND=$2
+      case "$BACKEND" in native|docker) ;; *) die 'backend must be native or docker.' ;; esac
+      shift 2 ;;
+    --check-only)
+      [[ "$ACTION" == apply ]] || die '--check-only requires apply.'
+      CHECK_ONLY=true
+      shift ;;
     *) die "unknown argument: $1" ;;
   esac
 done
@@ -121,7 +137,15 @@ if [[ "$ACTION" == prepare ]]; then
 fi
 
 check_worktree
+VALIDATOR="$WORKTREE/lib/upstream-integration-validation.ts"
+if [[ "$ACTION" == validate ]]; then
+  clean_worktree "$WORKTREE"
+  exec bun --no-env-file --config=/dev/null "$VALIDATOR" validate "$REPO" "$WORKTREE" "$UPSTREAM" "$BACKEND"
+fi
 if [[ "$ACTION" == apply ]]; then
+  APPLY_LOCK="$(common_dir "$REPO")/upstream-integration-validation.lock"
+  mkdir "$APPLY_LOCK" 2>/dev/null || die "another validation/apply may be running; inspect $APPLY_LOCK."
+  trap 'rmdir "$APPLY_LOCK"' EXIT
   clean_worktree "$WORKTREE"
   [[ -z "$(git -C "$REPO" diff --name-only)$(git -C "$REPO" diff --cached --name-only)" ]] \
     || die "local main has tracked changes; preserve them before apply: $REPO"
@@ -130,7 +154,13 @@ if [[ "$ACTION" == apply ]]; then
     || die "integration HEAD changed to $CURRENT_SHA; test that commit and apply its full ID."
   git -C "$WORKTREE" merge-base --is-ancestor main HEAD \
     || die 'local main advanced after prepare; run prepare and test the new integration commit.'
-  git -C "$REPO" merge --ff-only "$BRANCH" \
+  bun --no-env-file --config=/dev/null "$VALIDATOR" verify "$REPO" "$WORKTREE" "$UPSTREAM" "$TESTED_SHA" \
+    || die 'passing validation for this candidate is required before apply.'
+  if [[ "$CHECK_ONLY" == true ]]; then
+    printf 'Ready to apply %s. Check only: main and both hosts were not changed.\n' "$TESTED_SHA"
+    exit 0
+  fi
+  git -C "$REPO" merge --ff-only "$TESTED_SHA" \
     || die 'local main could not fast-forward; run prepare again.'
   printf 'Local main is now %s. Refreshing Claude Code...\n' "$CURRENT_SHA"
   (cd "$REPO" && ./setup --host claude) \
@@ -143,9 +173,12 @@ else
   printf 'Main:        %s\n' "$(git -C "$REPO" rev-parse HEAD)"
   printf 'Integration: %s (%s)\n' "$(git -C "$WORKTREE" rev-parse HEAD)" "$WORKTREE"
   printf 'Upstream:    %s (%s/main)\n' "$(git -C "$REPO" rev-parse "$UPSTREAM/main")" "$UPSTREAM"
+  if [[ -f "$VALIDATOR" ]]; then
+    bun --no-env-file --config=/dev/null "$VALIDATOR" status "$REPO" "$WORKTREE" "$UPSTREAM"
+  fi
   if [[ "$ACTION" == prepare ]]; then
-    printf '\nTest the integration worktree, then apply its full commit ID:\n'
-    printf '  cd %q && bun install --frozen-lockfile && bun run build && bun run typecheck && bun run test\n' "$WORKTREE"
-    printf '  %q apply %s\n' "$0" "$(git -C "$WORKTREE" rev-parse HEAD)"
+    printf '\nCommit any candidate changes, then validate without activating:\n'
+    printf '  %q validate --repo %q --worktree %q\n' "$WORKTREE/bin/gstack-integrate-upstream" "$REPO" "$WORKTREE"
+    printf 'After validation and approval, use that candidate command to apply its full commit ID.\n'
   fi
 fi

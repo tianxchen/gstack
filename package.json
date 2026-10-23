@@ -10,6 +10,7 @@
   },
   "scripts": {
     "build": "bash scripts/build.sh",
+    "integration:browser": "playwright install chromium",
     "build:cso": "bash scripts/build-cso.sh",
     "format:cso": "prettier --write 'lib/cso/*.ts'",
     "format:cso:check": "prettier --check 'lib/cso/*.ts'",
