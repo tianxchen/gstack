@@ -18,6 +18,8 @@ cd /path/to/gstack
 run, and merges local `main` and the fetched upstream commit there. It does not
 change local `main`. If Git reports a conflict, edit the files in the integration
 worktree, stage and commit the resolution, then run `prepare` again.
+For a shallow checkout it also fetches complete history, which Git needs to
+make a self-contained validation snapshot.
 
 Review the candidate and commit your changes in the integration worktree.
 Use the Bun version required by the candidate's `package.json`. Run validation

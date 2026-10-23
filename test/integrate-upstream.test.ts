@@ -399,3 +399,21 @@ test("conflicting upstream changes stop in the integration worktree and leave ma
     "local.txt",
   );
 });
+
+test("prepare completes shallow history before creating a validation bundle", () => {
+  const { root, publisher } = fixture();
+  writeFileSync(join(publisher, "new.txt"), "another upstream revision\n");
+  git(publisher, "add", ".");
+  git(publisher, "commit", "-m", "later upstream");
+  git(publisher, "push", "origin", "main");
+  const main = join(root, "shallow-gstack");
+  const integration = join(root, "shallow-integration");
+  git(root, "clone", "--depth=1", `file://${join(root, "upstream.git")}`, main);
+  git(main, "config", "user.name", "Test");
+  git(main, "config", "user.email", "test@example.com");
+  expect(git(main, "rev-parse", "--is-shallow-repository")).toBe("true");
+  const prepared = call(main, integration, "prepare");
+  expect(prepared.code).toBe(0);
+  expect(git(main, "rev-parse", "--is-shallow-repository")).toBe("false");
+  validate(main, integration);
+});

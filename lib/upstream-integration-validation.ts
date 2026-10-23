@@ -589,6 +589,11 @@ async function validate(
   let isolated: string | undefined;
   try {
     receipt.bun = checkBun(worktree);
+    if (git(worktree, "rev-parse", "--is-shallow-repository") === "true") {
+      throw new Error(
+        "Git history is shallow; run prepare to fetch complete history before validation",
+      );
+    }
     const bundle = path.join(run, "source.bundle");
     git(
       worktree,

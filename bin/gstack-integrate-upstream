@@ -116,9 +116,14 @@ if [[ "$ACTION" == prepare ]]; then
   UPSTREAM_HOST=${UPSTREAM_HOST#*@}
   UPSTREAM_HOST=${UPSTREAM_HOST%%[/:]*}
   printf 'Fetching %s/main from %s\n' "$UPSTREAM" "${UPSTREAM_HOST:-local}"
+  FETCH_ARGS=(fetch "$UPSTREAM" main)
+  if [[ "$(git -C "$REPO" rev-parse --is-shallow-repository)" == true ]]; then
+    FETCH_ARGS=(fetch --unshallow "$UPSTREAM" main)
+    printf 'Fetching complete history so validation snapshots contain every ancestor.\n'
+  fi
   GIT_TERMINAL_PROMPT=0 _receipted_git open upstream-integration "${UPSTREAM_HOST:-local}" \
     gstack-upstream-fetch 'user ran gstack-integrate-upstream prepare' \
-    git -C "$REPO" fetch "$UPSTREAM" main
+    git -C "$REPO" "${FETCH_ARGS[@]}"
   if [[ -e "$WORKTREE" ]]; then
     check_worktree
     clean_worktree "$WORKTREE"
