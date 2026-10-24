@@ -13,7 +13,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { canonicalRemote, legacyRemoteSlug, remoteSlug } from '../lib/remote-identity';
-import { normalizeRemoteUrl } from '../bin/gstack-global-discover';
+import { normalizeRemoteUrl } from '../bin/gstack-global-discover.ts';
 
 const ROOT = path.resolve(import.meta.dir, '..');
 const VECTORS: Array<{ url: string; canonical: string; slug: string; legacy_slug: string }> = JSON.parse(
