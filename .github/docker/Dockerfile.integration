@@ -8,9 +8,10 @@ ENV PATH=/opt/gstack-bun/bin:${PATH}
 RUN ln -s /opt/gstack-bun/bin/bun /opt/gstack-bun/bin/bunx \
     && apt-get update \
     && apt-get install -y --no-install-recommends git python3 python3-venv curl unzip zip \
-       jq bc file gcc libc6-dev poppler-utils fonts-noto-color-emoji xvfb xauth x11-utils zsh \
+       jq bc file gcc clang libc6-dev poppler-utils fonts-noto-color-emoji xvfb xauth x11-utils zsh \
        gh ripgrep procps psmisc openssh-client \
     && git --no-lazy-fetch --version \
+    && python3 -c 'import uuid; print(uuid.uuid4().hex)' > /etc/machine-id \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /workspace && chmod 1777 /workspace
 ARG PLAYWRIGHT_VERSION

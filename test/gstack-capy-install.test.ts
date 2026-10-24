@@ -25,6 +25,13 @@ const write = (file: string, text: string, mode = 0o644) => {
 const script = (file: string, lines: string[]) => write(file, ['#!/usr/bin/env bash', ...lines].join('\n') + '\n', 0o755);
 const sh = (cmd: string, cwd?: string) => spawnSync('bash', ['-c', cmd], { cwd, encoding: 'utf8', timeout: 30_000 });
 
+/** Build the archive fixture for the CPU that will execute the installer. */
+function bunArchiveTarget(): string {
+  if (os.arch() === 'arm64') return 'linux-aarch64';
+  if (os.arch() !== 'x64') throw new Error(`Unsupported Bun archive fixture CPU: ${os.arch()}`);
+  return /\bavx2\b/.test(fs.readFileSync('/proc/cpuinfo', 'utf8')) ? 'linux-x64' : 'linux-x64-baseline';
+}
+
 /** PATH without any directory that holds bun, node, curl or jq-less shims; real git/jq/unzip/sha256sum stay reachable. */
 function hostPath(base: string, hide: string[]): string {
   return (process.env.PATH ?? '').split(path.delimiter).filter(Boolean).map((dir, i) => {
@@ -218,7 +225,7 @@ describe('gstack-capy-install', () => {
     expect(r.stderr).toContain('SHA-256 mismatch');
     expect(r.stderr).toContain('nothing installed');
     expect(f.calls().filter(l => l.startsWith('curl '))).toHaveLength(1);
-    expect(f.calls()[0]).toContain('https://github.com/oven-sh/bun/releases/download/bun-v1.4.3/bun-linux-x64');
+    expect(f.calls()[0]).toContain(`https://github.com/oven-sh/bun/releases/download/bun-v1.4.3/bun-${bunArchiveTarget()}`);
     expect(fs.existsSync(path.join(f.home, '.bun/bin/bun'))).toBe(false);
     expect(fs.existsSync(store(f, '1.4.3'))).toBe(false);
     expect(fs.readdirSync(path.dirname(store(f, '1.4.3')))).toEqual([]);
@@ -227,7 +234,7 @@ describe('gstack-capy-install', () => {
 
   test.skipIf(process.platform !== 'linux')('Bun below the minimum: a verified archive is published in the runtime store (never ~/.bun/bin) and ./setup runs on it', () => {
     const f = fixture({ bun: '1.3.14' });
-    const target = sh('grep -q avx2 /proc/cpuinfo && echo linux-x64 || echo linux-x64-baseline').stdout.trim();
+    const target = bunArchiveTarget();
     const zip = path.join(f.base, 'good.zip');
     fs.mkdirSync(path.join(f.base, `z/bun-${target}`), { recursive: true });
     script(path.join(f.base, `z/bun-${target}/bun`), ['echo 1.4.3']);
@@ -315,7 +322,7 @@ describe('gstack-capy-install', () => {
 // HEAD was already set up, and a verdict file records what was certified.
 describe('gstack-capy-install: launch PATH, Bun reuse, CI pins, setup skip, verdict', () => {
   const zipBun = (f: ReturnType<typeof fixture>, version: string, runsTs = false) => {
-    const target = sh('grep -q avx2 /proc/cpuinfo && echo linux-x64 || echo linux-x64-baseline').stdout.trim();
+    const target = bunArchiveTarget();
     const zip = path.join(f.base, `bun-${version}.zip`);
     fs.mkdirSync(path.join(f.base, `z/bun-${target}`), { recursive: true });
     script(path.join(f.base, `z/bun-${target}/bun`), runsTs
@@ -435,7 +442,7 @@ describe.skipIf(process.platform !== 'linux')('gstack-capy-install: one resoluti
     sh('git init -q', project);
     return project;
   };
-  const target = () => sh('grep -q avx2 /proc/cpuinfo && echo linux-x64 || echo linux-x64-baseline').stdout.trim();
+  const target = bunArchiveTarget;
   const zipFor = (f: ReturnType<typeof fixture>, version: string) => {
     const t = target();
     const dir = path.join(f.base, `z-${version}`);
