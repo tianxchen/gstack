@@ -122,6 +122,7 @@ host, and says which ones failed.
 If you keep custom commits on a local gstack checkout, use the
 [upstream integration workflow](docs/howto-integrate-custom-gstack.md) to merge
 new upstream commits in a separate worktree before refreshing both hosts.
+The [operational runbook](docs/operating-custom-gstack-updates.md) gives the steps for this Mac, including approval, verification and recovery.
 
 A checkout carries skills only for the agents installed from it. Setup records
 them in `.gstack-installed-hosts` and never drops one, so adding an agent later

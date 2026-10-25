@@ -1,5 +1,8 @@
 # Keep a customized gstack checkout current
 
+For the configured Mac, follow the [operational runbook](operating-custom-gstack-updates.md)
+for update prompts, approval gates, exact commands, verification and recovery.
+
 Use this workflow when `origin` is the upstream gstack repository and your local
 `main` contains custom commits. It retains those commits while bringing in
 `origin/main`. The same source checkout can serve Claude Code and Codex.
@@ -78,8 +81,12 @@ tracked edits on local `main`, or a local `main` that moved since validation.
 Preserve and commit local changes before the final prepare/validation pass;
 never discard them to make apply succeed. When the checks pass, it fast-forwards local
 `main` and runs `./setup --host claude` and `./setup --host codex`. If a setup
-step fails, local `main` remains at the integrated commit; fix the reported
-setup issue and rerun that host's setup command. The script never pushes.
+step fails after main advanced, local `main` remains at the integrated commit.
+Do not rerun `apply` in that state. Follow the operational runbook's
+[partial-host recovery procedure](operating-custom-gstack-updates.md#recover-a-partial-host-refresh):
+confirm the approved HEAD, tracked cleanliness and host/state roots before setup.
+A Claude failure leaves Codex setup unstarted, so recover Claude, then Codex;
+a Codex-only failure requires only Codex setup. The script never pushes.
 
 Use `./bin/gstack-integrate-upstream status` to see the local, integration, and
 fetched upstream commit IDs. `--repo`, `--worktree`, `--branch`, and `--upstream`
